@@ -17,8 +17,6 @@ import {
 } from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
 import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 
-import {IProtocolConfig} from "./interfaces/IProtocolConfig.sol";
-
 /// @title EthFeeHook
 /// @notice Uniswap v4 hook that charges a fee on every swap in native-ETH pools created by the TokenFactory. The fee is
 ///         always taken on the ETH side of the swap (ETH in on buys, ETH out on sells), so it is always paid in ETH.
@@ -26,10 +24,14 @@ import {IProtocolConfig} from "./interfaces/IProtocolConfig.sol";
 ///         fee = creator fee (0-5%, can only be lowered)          -> creator, minus the protocol share (max 10%)
 ///             + sniper fee (decays to 0 shortly after launch)    -> protocol
 ///
+///         The protocol's part is credited to the factory immediately, as ERC-6909 ETH claims on the PoolManager, so
+///         the factory owner can withdraw all platform revenue in one call. Swaps made by the factory itself (the
+///         creator's launch buy) pay no fee.
+///
 ///         The sniper fee makes the total fee start at `sniperStartFeeBps` (e.g. 80%) at launch and decay
 ///         exponentially to the creator fee over `sniperDuration` seconds (e.g. 15s).
 /// @dev    Fees are accrued as ERC-6909 ETH claims on the PoolManager (no ETH moves during the swap, so a swap can
-///         never fail because a fee recipient rejects ETH) and are paid out in ETH through `claim`/`claimProtocol`.
+///         never fail because a fee recipient rejects ETH) and creators are paid out in ETH through `claim`.
 ///         One hook instance serves every pool the factory creates: a v4 hook's permissions are encoded in its
 ///         address, so a per-token hook would need a fresh CREATE2 salt mined for every launch.
 contract EthFeeHook is IHooks, IUnlockCallback {
@@ -47,7 +49,7 @@ contract EthFeeHook is IHooks, IUnlockCallback {
     uint256 internal constant ONE = 1e18;
 
     IPoolManager public immutable poolManager;
-    /// @notice The factory allowed to create pools with this hook. It supplies the protocol fee recipient.
+    /// @notice The factory allowed to create pools with this hook. Receives the protocol's share of every fee.
     address public immutable factory;
 
     struct SniperConfig {
@@ -71,8 +73,6 @@ contract EthFeeHook is IHooks, IUnlockCallback {
     mapping(PoolId => PoolConfig) public poolConfig;
     /// @notice ETH owed to each pool owner, claimable with `claim`.
     mapping(address => uint256) public owed;
-    /// @notice ETH owed to the platform, paid to the factory's current protocol recipient by `claimProtocol`.
-    uint256 public protocolOwed;
 
     event PoolRegistered(
         PoolId indexed poolId, address indexed owner, uint16 feeBps, uint16 protocolShareBps, SniperConfig sniper
@@ -81,7 +81,6 @@ contract EthFeeHook is IHooks, IUnlockCallback {
     event PoolOwnershipTransferred(PoolId indexed poolId, address indexed previousOwner, address indexed newOwner);
     event FeeAccrued(PoolId indexed poolId, address indexed owner, uint256 ownerAmount, uint256 protocolAmount);
     event Claimed(address indexed recipient, uint256 amount);
-    event ProtocolClaimed(address indexed recipient, uint256 amount);
 
     error NotPoolManager();
     error NotFactory();
@@ -235,16 +234,6 @@ contract EthFeeHook is IHooks, IUnlockCallback {
         return _claimOwner(recipient);
     }
 
-    /// @notice Pays out the platform's accrued fees to the factory's protocol recipient. Callable by anyone.
-    function claimProtocol() external returns (uint256 amount) {
-        amount = protocolOwed;
-        if (amount == 0) revert NothingToClaim();
-        protocolOwed = 0;
-        address recipient = IProtocolConfig(factory).protocolRecipient();
-        poolManager.unlock(abi.encode(recipient, amount));
-        emit ProtocolClaimed(recipient, amount);
-    }
-
     function _claimOwner(address recipient) internal returns (uint256 amount) {
         amount = owed[recipient];
         if (amount == 0) revert NothingToClaim();
@@ -279,12 +268,12 @@ contract EthFeeHook is IHooks, IUnlockCallback {
     /// @dev When ETH is the specified currency (exact-in buy / exact-out sell) the fee is taken here, on the amount the
     ///      user specified: the caller pays `amount` ETH of which `amount - fee` is swapped on an exact-in buy, or
     ///      receives exactly `amount` ETH while the pool pays out `amount + fee` on an exact-out sell.
-    function beforeSwap(address, PoolKey calldata key, SwapParams calldata params, bytes calldata)
+    function beforeSwap(address sender, PoolKey calldata key, SwapParams calldata params, bytes calldata)
         external
         onlyPoolManager
         returns (bytes4, BeforeSwapDelta, uint24)
     {
-        if (_ethIsSpecified(params)) {
+        if (sender != factory && _ethIsSpecified(params)) {
             uint256 amount =
                 params.amountSpecified < 0 ? uint256(-params.amountSpecified) : uint256(params.amountSpecified);
             uint256 fee = _accrue(key, amount);
@@ -295,12 +284,14 @@ contract EthFeeHook is IHooks, IUnlockCallback {
 
     /// @dev When ETH is the unspecified currency (exact-in sell / exact-out buy) the fee is taken here, on the ETH
     ///      amount the swap actually produced: the seller receives `out - fee`, the buyer pays `in + fee`.
-    function afterSwap(address, PoolKey calldata key, SwapParams calldata params, BalanceDelta delta, bytes calldata)
-        external
-        onlyPoolManager
-        returns (bytes4, int128)
-    {
-        if (_ethIsSpecified(params)) return (IHooks.afterSwap.selector, 0);
+    function afterSwap(
+        address sender,
+        PoolKey calldata key,
+        SwapParams calldata params,
+        BalanceDelta delta,
+        bytes calldata
+    ) external onlyPoolManager returns (bytes4, int128) {
+        if (sender == factory || _ethIsSpecified(params)) return (IHooks.afterSwap.selector, 0);
         int128 ethDelta = delta.amount0();
         uint256 amount = uint256(int256(ethDelta < 0 ? -ethDelta : ethDelta));
         uint256 fee = _accrue(key, amount);
@@ -313,23 +304,25 @@ contract EthFeeHook is IHooks, IUnlockCallback {
         return params.zeroForOne == (params.amountSpecified < 0);
     }
 
-    /// @dev Computes the fee, mints the hook ERC-6909 ETH claims for it (balancing the delta the hook returns to the
-    ///      PoolManager) and credits the owner and the platform.
+    /// @dev Computes the fee and mints ERC-6909 ETH claims for it (balancing the delta the hook returns to the
+    ///      PoolManager): the owner's part to this hook, credited to `owed`; the protocol's part straight to the factory.
     function _accrue(PoolKey calldata key, uint256 amount) internal returns (uint256 fee) {
         PoolId id = key.toId();
         (uint256 totalBps, uint256 sniperBps) = currentFee(id);
         fee = amount * totalBps / BPS;
         if (fee == 0) return 0;
-        poolManager.mint(address(this), CurrencyLibrary.ADDRESS_ZERO.toId(), fee);
-
         PoolConfig storage cfg = poolConfig[id];
         uint256 sniperAmount = amount * sniperBps / BPS;
         uint256 creatorFee = fee - sniperAmount;
         uint256 protocolAmount = sniperAmount + creatorFee * cfg.protocolShareBps / BPS;
         uint256 ownerAmount = fee - protocolAmount;
         address owner = cfg.owner;
-        owed[owner] += ownerAmount;
-        protocolOwed += protocolAmount;
+        uint256 ethId = CurrencyLibrary.ADDRESS_ZERO.toId();
+        if (ownerAmount > 0) {
+            poolManager.mint(address(this), ethId, ownerAmount);
+            owed[owner] += ownerAmount;
+        }
+        if (protocolAmount > 0) poolManager.mint(factory, ethId, protocolAmount);
         emit FeeAccrued(id, owner, ownerAmount, protocolAmount);
     }
 

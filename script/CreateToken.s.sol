@@ -7,12 +7,13 @@ import {TokenFactory} from "../src/TokenFactory.sol";
 
 /// @notice Launches an ERC20 through a deployed factory.
 ///
-/// Env: FACTORY (required), NAME, SYMBOL, SUPPLY (whole tokens), FEE_BPS, MARKET_CAP (wei of ETH), SALT
+/// Env: FACTORY (required), NAME, SYMBOL, SUPPLY (whole tokens), FEE_BPS, MARKET_CAP (wei of ETH), SALT,
+///      OWNER_BUY (wei of ETH to spend on a fee-free launch buy, default 0)
 ///
 /// forge script script/CreateToken.s.sol --rpc-url base_sepolia --account <keystore> --broadcast
 contract CreateToken is Script {
     function run() external returns (address token, PoolId poolId) {
-        TokenFactory factory = TokenFactory(vm.envAddress("FACTORY"));
+        TokenFactory factory = TokenFactory(payable(vm.envAddress("FACTORY")));
         TokenFactory.ERC20Params memory p = TokenFactory.ERC20Params({
             name: vm.envOr("NAME", string("Test Token")),
             symbol: vm.envOr("SYMBOL", string("TEST")),
@@ -23,7 +24,7 @@ contract CreateToken is Script {
         });
 
         vm.startBroadcast();
-        (token, poolId) = factory.createERC20(p);
+        (token, poolId) = factory.createERC20{value: vm.envOr("OWNER_BUY", uint256(0))}(p);
         vm.stopBroadcast();
 
         console.log("Token:", token);

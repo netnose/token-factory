@@ -4,12 +4,16 @@ pragma solidity 0.8.26;
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ERC1155Holder} from "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
 import {ERC721Holder} from "@openzeppelin/contracts/token/ERC721/utils/ERC721Holder.sol";
+import {IERC2981} from "@openzeppelin/contracts/interfaces/IERC2981.sol";
+import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import {IERC1155} from "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 
 import {TokenFactory} from "../src/TokenFactory.sol";
 import {FactoryERC721} from "../src/tokens/FactoryERC721.sol";
 import {FactoryERC1155} from "../src/tokens/FactoryERC1155.sol";
 import {MintRevenue} from "../src/tokens/MintRevenue.sol";
 import {FactoryFixture} from "./TokenFactory.t.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 
 /// @dev Tries to mint past the limits again from inside the ERC721 receive callback.
 contract ReentrantMinter is ERC721Holder {
@@ -50,12 +54,23 @@ contract NFTTest is FactoryFixture, ERC1155Holder {
                     symbol: "COL",
                     baseURI: "ipfs://base/",
                     sale: FactoryERC721.SaleConfig({price: 0.1 ether, maxSupply: 10, maxPerWallet: 3, active: true}),
+                    royalty: FactoryERC721.RoyaltyConfig({receiver: address(0), bps: 500}),
                     salt: bytes32(0)
                 })
             )
         );
-        items = FactoryERC1155(factory.createERC1155("Items", "ITM", "ipfs://items/{id}.json", bytes32(0)));
+        items = FactoryERC1155(factory.createERC1155(_erc1155Params(bytes32(0))));
         vm.stopPrank();
+    }
+
+    function _erc1155Params(bytes32 salt) internal view returns (TokenFactory.ERC1155Params memory) {
+        return TokenFactory.ERC1155Params({
+            name: "Items",
+            symbol: "ITM",
+            uri: "ipfs://items/{id}.json",
+            royalty: FactoryERC721.RoyaltyConfig({receiver: treasury, bps: 250}),
+            salt: salt
+        });
     }
 
     // ---------------------------------------------------------------------------------------------------------------
@@ -81,8 +96,9 @@ contract NFTTest is FactoryFixture, ERC1155Holder {
         assertEq(nft.ownerOf(2), buyer);
         assertEq(nft.tokenURI(2), "ipfs://base/2");
         assertEq(nft.publicMinted(buyer), 2);
-        assertEq(address(nft).balance, 0.2 ether);
-        assertEq(nft.protocolOwed(), 0.02 ether);
+        // platform share sent to the factory on mint, the rest stays for the owner
+        assertEq(address(factory).balance, 0.02 ether);
+        assertEq(address(nft).balance, 0.18 ether);
     }
 
     function test_erc721_publicMint_wrongPayment() public {
@@ -158,13 +174,9 @@ contract NFTTest is FactoryFixture, ERC1155Holder {
         vm.prank(creator);
         nft.withdraw();
         assertEq(creator.balance - before, 0.27 ether);
-
-        nft.withdrawProtocol(); // anyone can trigger; pays the factory's protocol recipient
-        assertEq(treasury.balance, 0.03 ether);
         assertEq(address(nft).balance, 0);
+        assertEq(address(factory).balance, 0.03 ether);
 
-        vm.expectRevert(MintRevenue.NothingToWithdraw.selector);
-        nft.withdrawProtocol();
         vm.prank(creator);
         vm.expectRevert(MintRevenue.NothingToWithdraw.selector);
         nft.withdraw();
@@ -189,15 +201,17 @@ contract NFTTest is FactoryFixture, ERC1155Holder {
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, trader));
         nft.mint(trader);
         vm.expectRevert();
-        nft.initialize("x", "x", "x", trader, 0, FactoryERC721.SaleConfig(0, 0, 0, false));
+        nft.initialize(
+            "x", "x", "x", trader, 0, FactoryERC721.SaleConfig(0, 0, 0, false), FactoryERC721.RoyaltyConfig(trader, 0)
+        );
     }
 
     function test_protocolShareSnapshotAtCreation() public {
         vm.prank(platform);
-        factory.setProtocolConfig(treasury, 0);
+        factory.setProtocolShare(0);
         assertEq(nft.protocolShareBps(), PROTOCOL_SHARE);
         vm.prank(creator);
-        FactoryERC1155 later = FactoryERC1155(factory.createERC1155("L", "L", "", bytes32(uint256(1))));
+        FactoryERC1155 later = FactoryERC1155(factory.createERC1155(_erc1155Params(bytes32(uint256(1)))));
         assertEq(later.protocolShareBps(), 0);
     }
 
@@ -230,8 +244,8 @@ contract NFTTest is FactoryFixture, ERC1155Holder {
         assertEq(items.balanceOf(buyer, 1), 5);
         assertEq(items.balanceOf(buyer, 2), 2);
         assertEq(items.balanceOf(buyer, 3), 10);
-        assertEq(address(items).balance, 1.05 ether);
-        assertEq(items.protocolOwed(), 0.105 ether);
+        assertEq(address(factory).balance, 0.105 ether);
+        assertEq(address(items).balance, 0.945 ether);
     }
 
     function test_erc1155_saleClosedByDefault() public {
@@ -295,13 +309,111 @@ contract NFTTest is FactoryFixture, ERC1155Holder {
         vm.prank(creator);
         items.withdraw();
         assertEq(creator.balance - before, 1.8 ether);
-        items.withdrawProtocol();
-        assertEq(treasury.balance, 0.2 ether);
+        assertEq(address(factory).balance, 0.2 ether);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Per-id URIs
+    // ---------------------------------------------------------------------------------------------------------------
+
+    function test_erc1155_tokenURIDefaultsToBase() public {
+        assertEq(items.uri(1), "ipfs://items/{id}.json");
+        vm.prank(creator);
+        items.setTokenURI(1, "ipfs://special/1.json");
+        assertEq(items.uri(1), "ipfs://special/1.json");
+        assertEq(items.uri(2), "ipfs://items/{id}.json");
+
+        vm.prank(creator);
+        items.setURI("ipfs://v2/{id}.json");
+        assertEq(items.uri(1), "ipfs://special/1.json");
+        assertEq(items.uri(2), "ipfs://v2/{id}.json");
+
+        vm.prank(creator);
+        items.setTokenURI(1, ""); // back to the base
+        assertEq(items.uri(1), "ipfs://v2/{id}.json");
+
+        vm.prank(trader);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, trader));
+        items.setTokenURI(1, "x");
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Royalties
+    // ---------------------------------------------------------------------------------------------------------------
+
+    function test_royalties_setAtCreation() public view {
+        // ERC721: receiver defaulted to the creator
+        (address r1, uint256 a1) = nft.royaltyInfo(1, 1 ether);
+        assertEq(r1, creator);
+        assertEq(a1, 0.05 ether);
+        // ERC1155: explicit receiver
+        (address r2, uint256 a2) = items.royaltyInfo(7, 1 ether);
+        assertEq(r2, treasury);
+        assertEq(a2, 0.025 ether);
+
+        assertTrue(nft.supportsInterface(type(IERC2981).interfaceId));
+        assertTrue(nft.supportsInterface(type(IERC721).interfaceId));
+        assertTrue(items.supportsInterface(type(IERC2981).interfaceId));
+        assertTrue(items.supportsInterface(type(IERC1155).interfaceId));
+    }
+
+    function test_royalties_ownerManagesAndCapped() public {
+        vm.startPrank(creator);
+        items.setTokenRoyalty(3, buyer, 1_000);
+        (address r, uint256 a) = items.royaltyInfo(3, 1 ether);
+        assertEq(r, buyer);
+        assertEq(a, 0.1 ether);
+        (r, a) = items.royaltyInfo(4, 1 ether);
+        assertEq(r, treasury); // other ids keep the default
+
+        items.setTokenRoyalty(3, address(0), 0); // reset to default
+        (r,) = items.royaltyInfo(3, 1 ether);
+        assertEq(r, treasury);
+
+        vm.expectRevert(MintRevenue.RoyaltyTooHigh.selector);
+        nft.setDefaultRoyalty(creator, 1_001);
+        nft.setDefaultRoyalty(creator, 0); // remove
+        (, a) = nft.royaltyInfo(1, 1 ether);
+        assertEq(a, 0);
+        vm.stopPrank();
+
+        vm.prank(trader);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, trader));
+        nft.setDefaultRoyalty(trader, 100);
+    }
+
+    function test_royalties_cappedAtCreation() public {
+        TokenFactory.ERC1155Params memory p = _erc1155Params(bytes32(uint256(9)));
+        p.royalty.bps = 1_001;
+        vm.prank(creator);
+        vm.expectRevert(MintRevenue.RoyaltyTooHigh.selector);
+        factory.createERC1155(p);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Platform revenue: one withdraw for swap fees + mint revenue
+    // ---------------------------------------------------------------------------------------------------------------
+
+    function test_factoryWithdrawCollectsEverything() public {
+        // mint revenue
+        vm.prank(buyer);
+        nft.publicMint{value: 0.3 ether}(3);
+        // swap fees
+        (, PoolKey memory key) = _launch(500);
+        _swap(key, true, -1 ether, 1 ether);
+
+        uint256 expected = 0.03 ether + 0.05 ether * uint256(PROTOCOL_SHARE) / 10_000;
+        address payable to = payable(makeAddr("vault"));
+        vm.prank(platform);
+        assertEq(factory.withdraw(to), expected);
+        assertEq(to.balance, expected);
+        assertEq(address(factory).balance, 0);
+        assertEq(manager.balanceOf(address(factory), 0), 0);
     }
 
     function test_implementationsCannotBeInitialized() public {
         FactoryERC1155 impl = FactoryERC1155(factory.erc1155Implementation());
         vm.expectRevert();
-        impl.initialize("x", "x", "x", trader, 0);
+        impl.initialize("x", "x", "x", trader, 0, address(0), 0);
     }
 }

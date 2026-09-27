@@ -57,7 +57,7 @@ abstract contract FactoryFixture is Test {
         hook = EthFeeHook(hookAddr);
         vm.startPrank(platform);
         factory.setHook(hook);
-        factory.setProtocolConfig(treasury, PROTOCOL_SHARE);
+        factory.setProtocolShare(PROTOCOL_SHARE);
         vm.stopPrank();
 
         router = new PoolSwapTest(manager);
@@ -99,12 +99,17 @@ abstract contract FactoryFixture is Test {
         );
     }
 
+    /// @dev Platform swap-fee revenue: ERC-6909 ETH claims credited straight to the factory.
+    function _protocolClaims() internal view returns (uint256) {
+        return manager.balanceOf(address(factory), 0);
+    }
+
     function _totalOwed() internal view returns (uint256) {
-        return hook.owed(creator) + hook.protocolOwed();
+        return hook.owed(creator) + _protocolClaims();
     }
 
     function _assertHookSolvent() internal view {
-        assertEq(manager.balanceOf(address(hook), 0), _totalOwed(), "hook claims != owed");
+        assertEq(manager.balanceOf(address(hook), 0), hook.owed(creator), "hook claims != owed");
     }
 }
 
@@ -203,8 +208,8 @@ contract TokenFactoryTest is FactoryFixture {
         assertGt(IERC20(token).balanceOf(trader), 0);
         uint256 fee = 1 ether * 500 / 10_000;
         assertEq(_totalOwed(), fee);
-        assertEq(hook.protocolOwed(), fee * PROTOCOL_SHARE / 10_000);
-        assertEq(hook.owed(creator), fee - hook.protocolOwed());
+        assertEq(_protocolClaims(), fee * PROTOCOL_SHARE / 10_000);
+        assertEq(hook.owed(creator), fee - _protocolClaims());
         _assertHookSolvent();
     }
 
@@ -276,8 +281,10 @@ contract TokenFactoryTest is FactoryFixture {
             hook.claim();
             assertEq(creator.balance - before, creatorOwed);
         }
-        if (hook.protocolOwed() > 0) hook.claimProtocol();
+        vm.prank(platform);
+        factory.withdraw(payable(treasury));
         assertEq(manager.balanceOf(address(hook), 0), 0);
+        assertEq(_protocolClaims(), 0);
     }
 
     // ---------------------------------------------------------------------------------------------------------------
@@ -294,7 +301,7 @@ contract TokenFactoryTest is FactoryFixture {
         assertEq(_totalOwed(), 0.8 ether);
         // sniper part (75%) -> protocol; creator fee (5%) split 90/10
         uint256 creatorFee = 0.05 ether;
-        assertEq(hook.protocolOwed(), 0.75 ether + creatorFee * PROTOCOL_SHARE / 10_000);
+        assertEq(_protocolClaims(), 0.75 ether + creatorFee * PROTOCOL_SHARE / 10_000);
         assertEq(hook.owed(creator), creatorFee - creatorFee * PROTOCOL_SHARE / 10_000);
         _assertHookSolvent();
     }
@@ -325,9 +332,9 @@ contract TokenFactoryTest is FactoryFixture {
     function test_sniper_appliesToSellsToo() public {
         (address token, PoolKey memory key) = _launchNoWarp(0);
         _swap(key, true, -1 ether, 1 ether);
-        uint256 afterBuy = hook.protocolOwed();
+        uint256 afterBuy = _protocolClaims();
         _swap(key, false, -int256(IERC20(token).balanceOf(trader)), 0);
-        assertGt(hook.protocolOwed(), afterBuy);
+        assertGt(_protocolClaims(), afterBuy);
         assertEq(hook.owed(creator), 0);
     }
 
@@ -371,13 +378,14 @@ contract TokenFactoryTest is FactoryFixture {
         _swap(key, true, -2 ether, 2 ether);
 
         uint256 creatorOwed = hook.owed(creator);
-        uint256 protocolOwed = hook.protocolOwed();
+        uint256 protocolOwed = _protocolClaims();
 
         vm.prank(creator);
         hook.claim();
         assertEq(creator.balance, 100 ether + creatorOwed);
 
-        hook.claimProtocol();
+        vm.prank(platform);
+        factory.withdraw(payable(treasury));
         assertEq(treasury.balance, protocolOwed);
 
         assertEq(_totalOwed(), 0);
@@ -386,19 +394,21 @@ contract TokenFactoryTest is FactoryFixture {
         vm.expectRevert(EthFeeHook.NothingToClaim.selector);
         vm.prank(creator);
         hook.claim();
-        vm.expectRevert(EthFeeHook.NothingToClaim.selector);
-        hook.claimProtocol();
     }
 
-    function test_claimProtocol_paysCurrentRecipient() public {
+    function test_protocolShareCreditedToFactoryImmediately() public {
         (, PoolKey memory key) = _launch(500);
         _swap(key, true, -1 ether, 1 ether);
-        address newTreasury = makeAddr("newTreasury");
+        // No claim step: the factory holds the platform's share as soon as the swap settles.
+        assertEq(_protocolClaims(), 0.05 ether * uint256(PROTOCOL_SHARE) / 10_000);
+    }
+
+    function test_withdraw_onlyOwnerAndRecipient() public {
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
+        factory.withdraw(payable(treasury));
         vm.prank(platform);
-        factory.setProtocolConfig(newTreasury, 0);
-        uint256 amount = hook.protocolOwed();
-        hook.claimProtocol();
-        assertEq(newTreasury.balance, amount);
+        vm.expectRevert(TokenFactory.InvalidRecipient.selector);
+        factory.withdraw(payable(address(0)));
     }
 
     function test_recipientRejectingEthDoesNotBlockSwaps() public {
@@ -469,7 +479,7 @@ contract TokenFactoryTest is FactoryFixture {
         (, PoolKey memory oldKey) = _launch(500);
 
         vm.prank(platform);
-        factory.setProtocolConfig(treasury, 500);
+        factory.setProtocolShare(500);
 
         (,, uint16 oldShare,,,) = hook.poolConfig(oldKey.toId());
         assertEq(oldShare, PROTOCOL_SHARE);
@@ -480,17 +490,76 @@ contract TokenFactoryTest is FactoryFixture {
         assertEq(newShare, 500);
     }
 
-    function test_setProtocolConfig_onlyOwnerAndCappedAt10Percent() public {
+    function test_setProtocolShare_onlyOwnerAndCappedAt10Percent() public {
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
-        factory.setProtocolConfig(treasury, 0);
+        factory.setProtocolShare(0);
 
         vm.startPrank(platform);
         vm.expectRevert(TokenFactory.ProtocolShareTooHigh.selector);
-        factory.setProtocolConfig(treasury, 1_001);
-        vm.expectRevert(TokenFactory.InvalidRecipient.selector);
-        factory.setProtocolConfig(address(0), 0);
-        factory.setProtocolConfig(treasury, 1_000);
+        factory.setProtocolShare(1_001);
+        factory.setProtocolShare(1_000);
         vm.stopPrank();
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Owner launch buy
+    // ---------------------------------------------------------------------------------------------------------------
+
+    function test_ownerBuy_noFeesDuringSniperWindow() public {
+        uint256 ethBefore = creator.balance;
+        vm.prank(creator);
+        (address token, PoolId id) = factory.createERC20{value: 1 ether}(_params(500));
+
+        assertEq(ethBefore - creator.balance, 1 ether);
+        uint256 bought = IERC20(token).balanceOf(creator);
+        assertGt(bought, 0);
+        // no creator fee, no sniper fee, no protocol fee
+        assertEq(hook.owed(creator), 0);
+        assertEq(_protocolClaims(), 0);
+        (uint256 totalBps,) = hook.currentFee(id);
+        assertEq(totalBps, 8_000, "sniper window still active for everyone else");
+
+        // Same ETH through the same curve without a fee would buy exactly as much: compare against a fee-free pool.
+        vm.prank(trader);
+        (address t2,) = factory.createERC20(_params(0));
+        vm.warp(block.timestamp + SNIPER_DURATION);
+        PoolKey memory k2 = factory.poolKeyOf(t2);
+        _swap(k2, true, -1 ether, 1 ether);
+        assertEq(IERC20(t2).balanceOf(trader), bought);
+    }
+
+    function test_ownerBuy_thenSniperAppliesToOthers() public {
+        vm.prank(creator);
+        (address token,) = factory.createERC20{value: 1 ether}(_params(500));
+        PoolKey memory key = factory.poolKeyOf(token);
+        _swap(key, true, -1 ether, 1 ether);
+        assertEq(_totalOwed(), 0.8 ether);
+    }
+
+    function test_ownerBuy_largeBuyFollowsCurve() public {
+        // The locked range reaches the minimum tick, so a buy is always filled in full: with virtual reserves
+        // (supply tokens, marketCap ETH) the constant-product output is supply * v / (marketCap + v).
+        TokenFactory.ERC20Params memory p = _params(500);
+        p.totalSupply = 1_000 ether;
+        p.marketCapEth = 1 ether;
+        uint256 ethBefore = creator.balance;
+        vm.prank(creator);
+        (address token,) = factory.createERC20{value: 99 ether}(p);
+
+        assertEq(ethBefore - creator.balance, 99 ether);
+        assertApproxEqRel(IERC20(token).balanceOf(creator), 990 ether, 0.004e18);
+        assertEq(address(factory).balance, 0);
+    }
+
+    function test_noOwnerBuyWithoutValue() public {
+        (address token,) = _launch(500);
+        assertEq(IERC20(token).balanceOf(creator), 0);
+    }
+
+    function test_factoryIsOnlyFeeFreeSwapper() public {
+        (, PoolKey memory key) = _launch(500);
+        vm.expectRevert(EthFeeHook.NotPoolManager.selector);
+        hook.beforeSwap(address(factory), key, SwapParams(true, -1 ether, 0), "");
     }
 
     // ---------------------------------------------------------------------------------------------------------------

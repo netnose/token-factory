@@ -4,6 +4,7 @@ pragma solidity 0.8.26;
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {Address} from "@openzeppelin/contracts/utils/Address.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
@@ -16,11 +17,10 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
-import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmounts.sol";
 
 import {EthFeeHook} from "./EthFeeHook.sol";
-import {IProtocolConfig} from "./interfaces/IProtocolConfig.sol";
 import {FactoryERC20} from "./tokens/FactoryERC20.sol";
 import {FactoryERC721} from "./tokens/FactoryERC721.sol";
 import {FactoryERC1155} from "./tokens/FactoryERC1155.sol";
@@ -34,11 +34,15 @@ import {FactoryERC1155} from "./tokens/FactoryERC1155.sol";
 ///         lowered) in ETH on every buy and sell, plus a sniper fee that decays to zero shortly after launch. The
 ///         liquidity position is owned by this contract and there is no function to remove it: it is locked forever.
 ///
-///         ERC721 / ERC1155 collections support owner mints and paid public mints.
+///         The creator can buy at launch, in the same transaction, without paying any fee (`msg.value`).
 ///
-///         The factory owner sets the platform's share (max 10%) of swap fees and NFT mint revenue, and the sniper
-///         protection parameters. Both are snapshotted per token at creation, so changes never affect existing tokens.
-contract TokenFactory is Ownable, IUnlockCallback, IProtocolConfig {
+///         ERC721 / ERC1155 collections support owner mints, paid public mints and ERC-2981 royalties.
+///
+///         The factory owner sets the platform's share (max 10%) of creator swap fees and NFT mint revenue, and the
+///         sniper protection parameters. Both are snapshotted per token at creation, so changes never affect existing
+///         tokens. All platform revenue lands in this contract as it is earned - swap fees as ERC-6909 ETH claims on
+///         the PoolManager, mint revenue as ETH - and `withdraw` pays out both in one call.
+contract TokenFactory is Ownable, IUnlockCallback {
     using SafeERC20 for IERC20;
 
     /// @notice LP fee of launch pools. Zero: the hook fee is the only swap fee and the locked position earns nothing.
@@ -53,8 +57,6 @@ contract TokenFactory is Ownable, IUnlockCallback, IProtocolConfig {
     address public immutable erc1155Implementation;
 
     EthFeeHook public hook;
-    /// @inheritdoc IProtocolConfig
-    address public protocolRecipient;
     /// @notice Platform share of ERC20 creator fees and NFT mint revenue, for tokens created from now on.
     uint16 public protocolShareBps;
     /// @notice Sniper protection for ERC20s launched from now on.
@@ -79,7 +81,23 @@ contract TokenFactory is Ownable, IUnlockCallback, IProtocolConfig {
         string symbol;
         string baseURI;
         FactoryERC721.SaleConfig sale;
+        FactoryERC721.RoyaltyConfig royalty;
         bytes32 salt;
+    }
+
+    struct ERC1155Params {
+        string name;
+        string symbol;
+        /// Base URI for every id without its own URI (may contain the `{id}` placeholder).
+        string uri;
+        /// Collection-wide royalty; receiver defaults to the creator. bps max 1000, 0 = none.
+        FactoryERC721.RoyaltyConfig royalty;
+        bytes32 salt;
+    }
+
+    enum Action {
+        Launch,
+        Withdraw
     }
 
     enum TokenType {
@@ -101,10 +119,13 @@ contract TokenFactory is Ownable, IUnlockCallback, IProtocolConfig {
         uint256 marketCapEth,
         int24 startTick
     );
+    /// @notice The creator's fee-free launch buy.
+    event OwnerBuy(address indexed token, address indexed buyer, uint256 ethSpent, uint256 tokensBought);
     event ERC721Created(address indexed token, address indexed creator);
     event ERC1155Created(address indexed token, address indexed creator);
     event HookSet(address hook);
-    event ProtocolConfigUpdated(address recipient, uint16 shareBps);
+    event ProtocolShareUpdated(uint16 shareBps);
+    event Withdrawn(address indexed to, uint256 amount);
     event SniperConfigUpdated(EthFeeHook.SniperConfig config);
 
     error HookAlreadySet();
@@ -122,7 +143,6 @@ contract TokenFactory is Ownable, IUnlockCallback, IProtocolConfig {
         erc20Implementation = address(new FactoryERC20());
         erc721Implementation = address(new FactoryERC721());
         erc1155Implementation = address(new FactoryERC1155());
-        protocolRecipient = _owner;
         // Default sniper protection: 80% at launch, exponential decay to the creator fee over 15 seconds.
         sniperConfig = EthFeeHook.SniperConfig({startFeeBps: 8_000, duration: 15, halvings: 5});
     }
@@ -140,15 +160,28 @@ contract TokenFactory is Ownable, IUnlockCallback, IProtocolConfig {
         emit HookSet(address(_hook));
     }
 
-    /// @notice Sets where platform fees go (applies to all tokens, including existing ones) and the platform share
-    ///         (max 10%) for tokens created from now on.
-    function setProtocolConfig(address recipient, uint16 shareBps) external onlyOwner {
-        if (recipient == address(0)) revert InvalidRecipient();
+    /// @notice Sets the platform share (max 10%) of creator swap fees and NFT mint revenue for tokens created from
+    ///         now on.
+    function setProtocolShare(uint16 shareBps) external onlyOwner {
         if (shareBps > MAX_PROTOCOL_SHARE_BPS) revert ProtocolShareTooHigh();
-        protocolRecipient = recipient;
         protocolShareBps = shareBps;
-        emit ProtocolConfigUpdated(recipient, shareBps);
+        emit ProtocolShareUpdated(shareBps);
     }
+
+    /// @notice Withdraws all platform revenue: swap fees (ERC-6909 ETH claims on the PoolManager) and NFT mint
+    ///         revenue (ETH held here).
+    function withdraw(address payable to) external onlyOwner returns (uint256 amount) {
+        if (to == address(0)) revert InvalidRecipient();
+        uint256 claims = poolManager.balanceOf(address(this), CurrencyLibrary.ADDRESS_ZERO.toId());
+        if (claims > 0) poolManager.unlock(abi.encode(Action.Withdraw, abi.encode(to, claims)));
+        uint256 balance = address(this).balance;
+        if (balance > 0) Address.sendValue(to, balance);
+        amount = claims + balance;
+        emit Withdrawn(to, amount);
+    }
+
+    /// @notice Receives the platform's share of NFT mint revenue.
+    receive() external payable {}
 
     /// @notice Sets sniper protection for ERC20s launched from now on. `startFeeBps` 0 disables it.
     function setSniperConfig(EthFeeHook.SniperConfig calldata config) external onlyOwner {
@@ -162,9 +195,11 @@ contract TokenFactory is Ownable, IUnlockCallback, IProtocolConfig {
     // ---------------------------------------------------------------------------------------------------------------
 
     /// @notice Creates a fixed-supply ERC20 and launches it in a one-sided ETH/TOKEN v4 pool with the fee hook.
+    ///         Any ETH sent is the creator's launch buy: it is swapped into the pool right after it is created, with
+    ///         no fee (not even the sniper fee), and the tokens go to the caller. Unspent ETH is refunded.
     /// @return token The new token.
     /// @return poolId The id of its v4 pool.
-    function createERC20(ERC20Params calldata p) external returns (address token, PoolId poolId) {
+    function createERC20(ERC20Params calldata p) external payable returns (address token, PoolId poolId) {
         EthFeeHook _hook = hook;
         if (address(_hook) == address(0)) revert HookNotSet();
         if (p.totalSupply == 0 || p.totalSupply > type(uint128).max) revert InvalidSupply();
@@ -185,18 +220,7 @@ contract TokenFactory is Ownable, IUnlockCallback, IProtocolConfig {
 
         _hook.registerPool(key, msg.sender, p.feeBps, protocolShareBps, sniperConfig);
         poolManager.initialize(key, TickMath.getSqrtPriceAtTick(startTick));
-
-        // One-sided position holding only the token: [minTick, startTick] lies entirely at/below the current tick.
-        // Buying (ETH -> token) moves the price down through the range.
-        int24 minTick = TickMath.minUsableTick(TICK_SPACING);
-        uint128 liquidity = LiquidityAmounts.getLiquidityForAmount1(
-            TickMath.getSqrtPriceAtTick(minTick), TickMath.getSqrtPriceAtTick(startTick), p.totalSupply
-        );
-        poolManager.unlock(abi.encode(key, minTick, startTick, liquidity));
-
-        // Rounding leaves a few wei of the token unplaced; burn them so the whole supply is in the pool.
-        uint256 dust = IERC20(token).balanceOf(address(this));
-        if (dust > 0) IERC20(token).safeTransfer(DEAD, dust);
+        _seedPoolAndBuy(key, startTick, p.totalSupply);
 
         isFactoryToken[token] = true;
         tokenType[token] = TokenType.ERC20;
@@ -204,32 +228,66 @@ contract TokenFactory is Ownable, IUnlockCallback, IProtocolConfig {
         emit ERC20Created(token, msg.sender, poolId, p.totalSupply, p.feeBps, p.marketCapEth, startTick);
     }
 
+    /// @dev Adds the whole supply as one-sided liquidity and runs the creator's launch buy with `msg.value`.
+    function _seedPoolAndBuy(PoolKey memory key, int24 startTick, uint256 totalSupply) internal {
+        // One-sided position holding only the token: [minTick, startTick] lies entirely at/below the current tick.
+        // Buying (ETH -> token) moves the price down through the range.
+        int24 minTick = TickMath.minUsableTick(TICK_SPACING);
+        uint128 liquidity = LiquidityAmounts.getLiquidityForAmount1(
+            TickMath.getSqrtPriceAtTick(minTick), TickMath.getSqrtPriceAtTick(startTick), totalSupply
+        );
+        (uint256 ethSpent, uint256 tokensBought) = abi.decode(
+            poolManager.unlock(
+                abi.encode(Action.Launch, abi.encode(key, minTick, startTick, liquidity, msg.value, msg.sender))
+            ),
+            (uint256, uint256)
+        );
+        // Safety net only: the range reaches the minimum tick, so an exact-in buy is always filled in full.
+        if (msg.value > ethSpent) Address.sendValue(payable(msg.sender), msg.value - ethSpent);
+        if (tokensBought > 0) emit OwnerBuy(Currency.unwrap(key.currency1), msg.sender, ethSpent, tokensBought);
+
+        // Rounding leaves a few wei of the token unplaced; burn them so the whole supply is in the pool.
+        IERC20 token = IERC20(Currency.unwrap(key.currency1));
+        uint256 dust = token.balanceOf(address(this));
+        if (dust > 0) token.safeTransfer(DEAD, dust);
+    }
+
     /// @notice Creates an ERC721 collection owned by the caller, with its public sale configured.
     function createERC721(ERC721Params calldata p) external returns (address token) {
         token = Clones.cloneDeterministic(erc721Implementation, _salt(msg.sender, p.salt));
-        FactoryERC721(token).initialize(p.name, p.symbol, p.baseURI, msg.sender, protocolShareBps, p.sale);
+        FactoryERC721(token).initialize(p.name, p.symbol, p.baseURI, msg.sender, protocolShareBps, p.sale, p.royalty);
         isFactoryToken[token] = true;
         tokenType[token] = TokenType.ERC721;
         emit ERC721Created(token, msg.sender);
     }
 
-    /// @notice Creates an ERC1155 collection owned by the caller. Per-id sales are configured with `setSale`.
-    function createERC1155(string calldata name, string calldata symbol, string calldata uri, bytes32 salt)
-        external
-        returns (address token)
-    {
-        token = Clones.cloneDeterministic(erc1155Implementation, _salt(msg.sender, salt));
-        FactoryERC1155(token).initialize(name, symbol, uri, msg.sender, protocolShareBps);
+    /// @notice Creates an ERC1155 collection owned by the caller. Per-id sales and URIs are configured afterwards.
+    function createERC1155(ERC1155Params calldata p) external returns (address token) {
+        token = Clones.cloneDeterministic(erc1155Implementation, _salt(msg.sender, p.salt));
+        FactoryERC1155(token)
+            .initialize(p.name, p.symbol, p.uri, msg.sender, protocolShareBps, p.royalty.receiver, p.royalty.bps);
         isFactoryToken[token] = true;
         tokenType[token] = TokenType.ERC1155;
         emit ERC1155Created(token, msg.sender);
     }
 
-    /// @dev Adds the one-sided token liquidity and pays for it from the factory's token balance.
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
-        (PoolKey memory key, int24 tickLower, int24 tickUpper, uint128 liquidity) =
-            abi.decode(data, (PoolKey, int24, int24, uint128));
+        (Action action, bytes memory params) = abi.decode(data, (Action, bytes));
+        if (action == Action.Withdraw) {
+            (address to, uint256 amount) = abi.decode(params, (address, uint256));
+            poolManager.burn(address(this), CurrencyLibrary.ADDRESS_ZERO.toId(), amount);
+            poolManager.take(CurrencyLibrary.ADDRESS_ZERO, to, amount);
+            return "";
+        }
+        return _launch(params);
+    }
+
+    /// @dev Adds the one-sided token liquidity, paid from the factory's token balance, then executes the creator's
+    ///      launch buy. The hook charges no fee on swaps made by the factory.
+    function _launch(bytes memory params) internal returns (bytes memory) {
+        (PoolKey memory key, int24 tickLower, int24 tickUpper, uint128 liquidity, uint256 buyAmount, address buyer) =
+            abi.decode(params, (PoolKey, int24, int24, uint128, uint256, address));
 
         (BalanceDelta delta,) = poolManager.modifyLiquidity(
             key,
@@ -244,7 +302,20 @@ contract TokenFactory is Ownable, IUnlockCallback, IProtocolConfig {
         poolManager.sync(key.currency1);
         IERC20(Currency.unwrap(key.currency1)).safeTransfer(address(poolManager), owed);
         poolManager.settle();
-        return "";
+
+        if (buyAmount == 0) return abi.encode(uint256(0), uint256(0));
+        BalanceDelta swapDelta = poolManager.swap(
+            key,
+            SwapParams({
+                zeroForOne: true, amountSpecified: -int256(buyAmount), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            ""
+        );
+        uint256 ethSpent = uint256(uint128(-swapDelta.amount0()));
+        uint256 tokensBought = uint256(uint128(swapDelta.amount1()));
+        poolManager.settle{value: ethSpent}();
+        poolManager.take(key.currency1, buyer, tokensBought);
+        return abi.encode(ethSpent, tokensBought);
     }
 
     // ---------------------------------------------------------------------------------------------------------------

@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import {ERC721Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC721/ERC721Upgradeable.sol";
+import {ERC2981Upgradeable} from "@openzeppelin/contracts-upgradeable/token/common/ERC2981Upgradeable.sol";
 import {MintRevenue} from "./MintRevenue.sol";
 
 /// @title FactoryERC721
@@ -10,6 +11,7 @@ import {MintRevenue} from "./MintRevenue.sol";
 ///         - Anyone can `publicMint` while the sale is open, paying the owner-set price per token (0 = free).
 ///         - `maxSupply` caps all mints (0 = unlimited) and can only be lowered once set.
 ///         - `maxPerWallet` caps public mints per address (0 = unlimited).
+///         - ERC-2981 royalties (max 10%), set at creation and managed by the owner.
 ///         Token ids start at 1 and increment; metadata lives at `baseURI + tokenId`.
 contract FactoryERC721 is ERC721Upgradeable, MintRevenue {
     struct SaleConfig {
@@ -17,6 +19,13 @@ contract FactoryERC721 is ERC721Upgradeable, MintRevenue {
         uint64 maxSupply;
         uint64 maxPerWallet;
         bool active;
+    }
+
+    struct RoyaltyConfig {
+        /// Defaults to the owner when zero.
+        address receiver;
+        /// Max 1000 (10%). 0 = no royalty.
+        uint96 bps;
     }
 
     string private _baseTokenURI;
@@ -48,10 +57,11 @@ contract FactoryERC721 is ERC721Upgradeable, MintRevenue {
         string calldata baseURI_,
         address owner_,
         uint16 protocolShareBps_,
-        SaleConfig calldata sale
+        SaleConfig calldata sale,
+        RoyaltyConfig calldata royalty
     ) external initializer {
         __ERC721_init(name_, symbol_);
-        __MintRevenue_init(owner_, protocolShareBps_);
+        __MintRevenue_init(owner_, protocolShareBps_, royalty.receiver, royalty.bps);
         _baseTokenURI = baseURI_;
         maxSupply = sale.maxSupply;
         _setSale(sale.price, sale.maxPerWallet, sale.active);
@@ -126,5 +136,14 @@ contract FactoryERC721 is ERC721Upgradeable, MintRevenue {
 
     function _baseURI() internal view override returns (string memory) {
         return _baseTokenURI;
+    }
+
+    function supportsInterface(bytes4 interfaceId)
+        public
+        view
+        override(ERC721Upgradeable, ERC2981Upgradeable)
+        returns (bool)
+    {
+        return super.supportsInterface(interfaceId);
     }
 }

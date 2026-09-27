@@ -7,13 +7,13 @@ A factory for ERC20, ERC721 and ERC1155 tokens on Uniswap v4. It targets Base Se
 | `src/TokenFactory.sol` | Deploys all three token types as cheap EIP-1167 clones with deterministic addresses. Launches each ERC20 into its own v4 pool. Holds the platform config. |
 | `src/EthFeeHook.sol` | Uniswap v4 hook that charges the creator fee (0–5%) plus a decaying sniper fee, always in ETH. |
 | `src/tokens/FactoryERC20.sol` | Fixed-supply ERC20 with EIP-2612 permit. No owner and no minting after launch. |
-| `src/tokens/FactoryERC721.sol` | ERC721 collection: free owner mint, plus a paid public mint. |
-| `src/tokens/FactoryERC1155.sol` | ERC1155 collection: free owner mint, plus a paid public mint with separate settings per token id. |
-| `src/tokens/MintRevenue.sol` | Splits public-mint revenue between the collection owner and the platform. |
+| `src/tokens/FactoryERC721.sol` | ERC721 collection: free owner mint, a paid public mint, and ERC-2981 royalties. |
+| `src/tokens/FactoryERC1155.sol` | ERC1155 collection: free owner mint, a paid public mint and a metadata URI per token id, and ERC-2981 royalties. |
+| `src/tokens/MintRevenue.sol` | Shared NFT plumbing: sends the platform's cut of each mint to the factory, handles owner withdrawals and royalties. |
 
 ## How an ERC20 launch works
 
-`createERC20(name, symbol, totalSupply, feeBps, marketCapEth, salt)` does all of the following in one transaction:
+`createERC20(name, symbol, totalSupply, feeBps, marketCapEth, salt)` is payable, and does all of the following in one transaction:
 
 1. It deploys the token clone and mints the **entire supply to the factory**. Nothing can be minted after that.
 2. It registers the pool with the hook:
@@ -24,7 +24,10 @@ A factory for ERC20, ERC721 and ERC1155 tokens on Uniswap v4. It targets Base Se
    - `factory.startTickFor(supply, marketCap)` shows the exact starting tick.
    - ETH is always `currency0`. The pool has an LP fee of 0, `tickSpacing` 60, and uses the `EthFeeHook`.
 4. It adds the whole supply as **one-sided liquidity** below the starting price. Buyers pay ETH to move down the curve, and sellers can swap back.
-5. The factory owns the position and has no function to remove it, so the **liquidity is locked forever**.
+5. **Owner buy:** any ETH sent with the call is swapped for the creator right away.
+   - This buy pays **no fees at all**: no creator fee, no sniper fee, no platform share. The hook skips fees for swaps made by the factory, and the factory swaps only during creation.
+   - The tokens go to the caller, and the buy emits an `OwnerBuy` event.
+6. The factory owns the position and has no function to remove it, so the **liquidity is locked forever**.
 
 ## Swap fees (always in ETH)
 
@@ -65,10 +68,11 @@ With a 5% creator fee, the total fee over time is:
 
 **Owner controls:** `lowerFee` lowers the fee and can never raise it. `transferPoolOwnership` sends future fees to a new address.
 
-**Payout:** fees build up in the hook as ERC-6909 ETH claims on the PoolManager.
-- Creators withdraw with `claim()`, or anyone can call `claimFor(addr)` on their behalf.
-- `claimProtocol()` pays the platform's balance to the factory's current `protocolRecipient`.
-- Because nothing is sent during a swap, a recipient that rejects ETH can never block trading.
+**Payout:** each fee is split between the creator and the platform at swap time, as ERC-6909 ETH claims on the PoolManager.
+- **Creator's part:** held by the hook. It's paid out with `claim()`, or anyone can call `claimFor(addr)` on the creator's behalf.
+- **Platform's part:** credited **straight to the factory** during the swap.
+- No ETH moves during a swap, so a recipient that rejects ETH can never block trading.
+- ETH can't be sent directly mid-swap, because the PoolManager may not hold it yet.
 
 ## NFT public mint
 
@@ -83,14 +87,20 @@ Both collections keep a free owner mint (`mint`, `mintBatch`). On top of that, *
 | Per-wallet limit (0 = unlimited) | Counts public mints only. | Per id. |
 
 Payment must be exact. The platform's share of mint revenue is fixed when the collection is created, and is at most 10%.
+- The platform's share is **sent to the factory as part of each mint**.
 - The owner collects the rest with `withdraw()`.
-- Anyone can call `withdrawProtocol()`, which pays the platform's share to the factory's current `protocolRecipient`.
+
+**ERC1155 metadata:** `setTokenURI(id, uri)` gives a token id its own URI. Ids without one use the collection's base URI (`setURI`, which may include `{id}`). Setting an empty string reverts the id to the base URI.
+
+**Royalties (ERC-2981):** both collection types support royalties, capped at 10%.
+- The royalty is set at creation. If no receiver is given, it defaults to the creator.
+- The owner can change it with `setDefaultRoyalty(receiver, bps)`, or override it for a single token id with `setTokenRoyalty(id, receiver, bps)`.
+- Setting `bps` to 0 removes or resets the royalty.
 
 ## Platform admin (factory owner)
 
-- `setProtocolConfig(recipient, shareBps)`: `shareBps` can be at most **10%**. It applies to swap-fee shares and NFT mint revenue.
-  - The recipient can be changed at any time, and existing balances follow it.
-  - The share is copied into each token when it's created, so changing it never affects existing tokens.
+- `setProtocolShare(shareBps)`: at most **10%**. It applies to creator swap fees and NFT mint revenue. The share is copied into each token when it's created, so changing it never affects existing tokens.
+- `withdraw(to)`: sends **all platform revenue in one call**. That covers swap-fee claims (the platform share plus all sniper fees) and ETH from NFT mints.
 - `setSniperConfig(...)`: applies only to launches from then on.
 
 There is no creation fee.
@@ -112,11 +122,11 @@ The script uses Uniswap v4's PoolManager on Base Sepolia, `0x05E73354cFDd6745C33
 
 ```bash
 cp .env.example .env && source .env
-# optional: PROTOCOL_SHARE_BPS (max 1000), PROTOCOL_RECIPIENT, FACTORY_OWNER
+# optional: PROTOCOL_SHARE_BPS (max 1000), FACTORY_OWNER
 forge script script/Deploy.s.sol --rpc-url base_sepolia --account <keystore> --broadcast --verify
 
 # launch a token
-FACTORY=<factory> NAME="My Token" SYMBOL=MYT FEE_BPS=300 MARKET_CAP=10000000000000000000 \
+FACTORY=<factory> NAME="My Token" SYMBOL=MYT FEE_BPS=300 MARKET_CAP=10000000000000000000 OWNER_BUY=100000000000000000 \
   forge script script/CreateToken.s.sol --rpc-url base_sepolia --account <keystore> --broadcast
 ```
 
@@ -126,5 +136,5 @@ The deploy script mines the hook salt against the standard CREATE2 deployer, dep
 
 - On an exact-in buy with a `sqrtPriceLimit` that stops the swap early, the fee is still charged on the full amount specified. Normal routers don't set a limit like that.
 - The sniper fee is based on timestamps. On Base (2 s blocks), the window is about 7–8 blocks.
-- The creator's own buy at launch also pays the sniper fee. There is no dev buy that skips it.
+- The creator's launch buy has no size limit and pays no fees. Buyers can see how much the creator bought through the `OwnerBuy` event.
 - None of this has been audited. Get a review before deploying to mainnet.

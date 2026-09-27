@@ -13,7 +13,6 @@ import {EthFeeHook} from "../src/EthFeeHook.sol";
 ///
 /// Env:
 ///   POOL_MANAGER         Uniswap v4 PoolManager (default: Base Sepolia 0x05E7...3408)
-///   PROTOCOL_RECIPIENT   receives the platform's share of swap fees (default: deployer)
 ///   PROTOCOL_SHARE_BPS   platform share of creator swap fees and NFT mint revenue, max 1000 (default: 0)
 ///   FACTORY_OWNER        final owner of the factory (default: deployer)
 ///
@@ -32,7 +31,6 @@ contract Deploy is Script {
 
         vm.startBroadcast();
         (, address deployer,) = vm.readCallers();
-        address protocolRecipient = vm.envOr("PROTOCOL_RECIPIENT", deployer);
         uint16 protocolShareBps = uint16(vm.envOr("PROTOCOL_SHARE_BPS", uint256(0)));
         address finalOwner = vm.envOr("FACTORY_OWNER", deployer);
 
@@ -47,7 +45,7 @@ contract Deploy is Script {
         require(address(hook) == expected, "hook address mismatch");
 
         factory.setHook(hook);
-        factory.setProtocolConfig(protocolRecipient, protocolShareBps);
+        factory.setProtocolShare(protocolShareBps);
         if (finalOwner != deployer) factory.transferOwnership(finalOwner);
         vm.stopBroadcast();
 
