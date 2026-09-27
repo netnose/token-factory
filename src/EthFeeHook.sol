@@ -1,0 +1,313 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.26;
+
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
+import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
+import {SafeCast} from "@uniswap/v4-core/src/libraries/SafeCast.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
+import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
+import {
+    BeforeSwapDelta,
+    BeforeSwapDeltaLibrary,
+    toBeforeSwapDelta
+} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
+import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+
+/// @title EthFeeHook
+/// @notice Uniswap v4 hook that charges a fee of up to 5% on every swap in native-ETH pools created by the
+///         TokenFactory. The fee is always taken on the ETH side of the swap (ETH in on buys, ETH out on sells),
+///         so the token owner is paid in ETH without any token -> ETH conversion.
+/// @dev    Fees are accrued as ERC-6909 ETH claims on the PoolManager (no ETH moves during the swap, so a swap can
+///         never fail because a fee recipient rejects ETH) and are paid out in ETH through `claim`.
+///         One hook instance serves every pool the factory creates: a v4 hook's permissions are encoded in its
+///         address, so a per-token hook would need a fresh CREATE2 salt mined for every launch.
+contract EthFeeHook is IHooks, IUnlockCallback {
+    using SafeCast for uint256;
+    using SafeCast for int256;
+
+    /// @notice Maximum swap fee a token owner can set: 5%.
+    uint16 public constant MAX_FEE_BPS = 500;
+    /// @notice Maximum share of the swap fee the platform can take: 50%.
+    uint16 public constant MAX_PROTOCOL_SHARE_BPS = 5_000;
+    uint256 internal constant BPS = 10_000;
+
+    IPoolManager public immutable poolManager;
+    /// @notice The factory allowed to create pools with this hook. Its owner administers the protocol fee.
+    address public immutable factory;
+
+    struct PoolConfig {
+        address owner; // receives the fee, may lower it
+        uint16 feeBps; // fee on the ETH side of every swap
+        uint16 protocolShareBps; // share of the fee paid to the platform, fixed at pool creation
+        bool registered;
+    }
+
+    mapping(PoolId => PoolConfig) public poolConfig;
+    /// @notice ETH owed to each fee recipient, claimable with `claim`.
+    mapping(address => uint256) public owed;
+
+    /// @notice Protocol share applied to pools registered from now on.
+    uint16 public protocolShareBps;
+    address public protocolRecipient;
+
+    event PoolRegistered(PoolId indexed poolId, address indexed owner, uint16 feeBps, uint16 protocolShareBps);
+    event FeeLowered(PoolId indexed poolId, uint16 oldFeeBps, uint16 newFeeBps);
+    event PoolOwnershipTransferred(PoolId indexed poolId, address indexed previousOwner, address indexed newOwner);
+    event FeeAccrued(PoolId indexed poolId, address indexed owner, uint256 ownerAmount, uint256 protocolAmount);
+    event Claimed(address indexed recipient, uint256 amount);
+    event ProtocolFeeUpdated(uint16 shareBps, address recipient);
+
+    error NotPoolManager();
+    error NotFactory();
+    error NotFactoryOwner();
+    error NotPoolOwner();
+    error PoolNotRegistered();
+    error PoolAlreadyRegistered();
+    error NotNativePool();
+    error FeeTooHigh();
+    error FeeNotLowered();
+    error InvalidRecipient();
+    error NothingToClaim();
+    error HookNotImplemented();
+
+    modifier onlyPoolManager() {
+        if (msg.sender != address(poolManager)) revert NotPoolManager();
+        _;
+    }
+
+    constructor(IPoolManager _poolManager, address _factory, address _protocolRecipient, uint16 _protocolShareBps) {
+        poolManager = _poolManager;
+        factory = _factory;
+        _setProtocolFee(_protocolShareBps, _protocolRecipient);
+        Hooks.validateHookPermissions(IHooks(address(this)), getHookPermissions());
+    }
+
+    function getHookPermissions() public pure returns (Hooks.Permissions memory) {
+        return Hooks.Permissions({
+            beforeInitialize: true,
+            afterInitialize: false,
+            beforeAddLiquidity: false,
+            afterAddLiquidity: false,
+            beforeRemoveLiquidity: false,
+            afterRemoveLiquidity: false,
+            beforeSwap: true,
+            afterSwap: true,
+            beforeDonate: false,
+            afterDonate: false,
+            beforeSwapReturnDelta: true,
+            afterSwapReturnDelta: true,
+            afterAddLiquidityReturnDelta: false,
+            afterRemoveLiquidityReturnDelta: false
+        });
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Factory / admin
+    // ---------------------------------------------------------------------------------------------------------------
+
+    /// @notice Registers the fee config for a pool. Must be called by the factory before it initializes the pool.
+    function registerPool(PoolKey calldata key, address owner, uint16 feeBps) external {
+        if (msg.sender != factory) revert NotFactory();
+        if (!key.currency0.isAddressZero()) revert NotNativePool();
+        if (feeBps > MAX_FEE_BPS) revert FeeTooHigh();
+        if (owner == address(0)) revert InvalidRecipient();
+        PoolId id = key.toId();
+        if (poolConfig[id].registered) revert PoolAlreadyRegistered();
+        uint16 share = protocolShareBps;
+        poolConfig[id] = PoolConfig({owner: owner, feeBps: feeBps, protocolShareBps: share, registered: true});
+        emit PoolRegistered(id, owner, feeBps, share);
+    }
+
+    /// @notice Sets the platform's share of swap fees for pools created from now on. Existing pools keep theirs.
+    function setProtocolFee(uint16 shareBps, address recipient) external {
+        if (msg.sender != Ownable(factory).owner()) revert NotFactoryOwner();
+        _setProtocolFee(shareBps, recipient);
+    }
+
+    function _setProtocolFee(uint16 shareBps, address recipient) internal {
+        if (shareBps > MAX_PROTOCOL_SHARE_BPS) revert FeeTooHigh();
+        if (recipient == address(0)) revert InvalidRecipient();
+        protocolShareBps = shareBps;
+        protocolRecipient = recipient;
+        emit ProtocolFeeUpdated(shareBps, recipient);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Pool owner
+    // ---------------------------------------------------------------------------------------------------------------
+
+    /// @notice Lowers the pool's swap fee. The fee can never be raised.
+    function lowerFee(PoolId id, uint16 newFeeBps) external {
+        PoolConfig storage cfg = poolConfig[id];
+        if (msg.sender != cfg.owner) revert NotPoolOwner();
+        uint16 old = cfg.feeBps;
+        if (newFeeBps >= old) revert FeeNotLowered();
+        cfg.feeBps = newFeeBps;
+        emit FeeLowered(id, old, newFeeBps);
+    }
+
+    /// @notice Transfers the right to receive (and lower) the pool's fee.
+    function transferPoolOwnership(PoolId id, address newOwner) external {
+        PoolConfig storage cfg = poolConfig[id];
+        if (msg.sender != cfg.owner) revert NotPoolOwner();
+        if (newOwner == address(0)) revert InvalidRecipient();
+        cfg.owner = newOwner;
+        emit PoolOwnershipTransferred(id, msg.sender, newOwner);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Claiming
+    // ---------------------------------------------------------------------------------------------------------------
+
+    /// @notice Pays out the caller's accrued fees in ETH.
+    function claim() external returns (uint256) {
+        return _claim(msg.sender);
+    }
+
+    /// @notice Pays out `recipient`'s accrued fees in ETH to `recipient`. Callable by anyone (e.g. a keeper).
+    function claimFor(address recipient) external returns (uint256) {
+        return _claim(recipient);
+    }
+
+    function _claim(address recipient) internal returns (uint256 amount) {
+        amount = owed[recipient];
+        if (amount == 0) revert NothingToClaim();
+        owed[recipient] = 0;
+        poolManager.unlock(abi.encode(recipient, amount));
+        emit Claimed(recipient, amount);
+    }
+
+    /// @dev Converts the hook's ERC-6909 ETH claims back into ETH and sends it to the recipient.
+    function unlockCallback(bytes calldata data) external onlyPoolManager returns (bytes memory) {
+        (address recipient, uint256 amount) = abi.decode(data, (address, uint256));
+        poolManager.burn(address(this), CurrencyLibrary.ADDRESS_ZERO.toId(), amount);
+        poolManager.take(CurrencyLibrary.ADDRESS_ZERO, recipient, amount);
+        return "";
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Hook callbacks
+    // ---------------------------------------------------------------------------------------------------------------
+
+    function beforeInitialize(address sender, PoolKey calldata key, uint160)
+        external
+        view
+        onlyPoolManager
+        returns (bytes4)
+    {
+        if (sender != factory) revert NotFactory();
+        if (!poolConfig[key.toId()].registered) revert PoolNotRegistered();
+        return IHooks.beforeInitialize.selector;
+    }
+
+    /// @dev When ETH is the specified currency (exact-in buy / exact-out sell) the fee is taken here, on the amount the
+    ///      user specified: the caller pays `amount + fee` ETH on an exact-in buy, or receives exactly `amount` ETH
+    ///      while the pool pays out `amount + fee` on an exact-out sell.
+    function beforeSwap(address, PoolKey calldata key, SwapParams calldata params, bytes calldata)
+        external
+        onlyPoolManager
+        returns (bytes4, BeforeSwapDelta, uint24)
+    {
+        if (_ethIsSpecified(params)) {
+            uint256 amount =
+                params.amountSpecified < 0 ? uint256(-params.amountSpecified) : uint256(params.amountSpecified);
+            uint256 fee = _accrue(key, amount);
+            if (fee > 0) return (IHooks.beforeSwap.selector, toBeforeSwapDelta(fee.toInt128(), 0), 0);
+        }
+        return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
+    }
+
+    /// @dev When ETH is the unspecified currency (exact-in sell / exact-out buy) the fee is taken here, on the ETH
+    ///      amount the swap actually produced: the seller receives `out - fee`, the buyer pays `in + fee`.
+    function afterSwap(address, PoolKey calldata key, SwapParams calldata params, BalanceDelta delta, bytes calldata)
+        external
+        onlyPoolManager
+        returns (bytes4, int128)
+    {
+        if (_ethIsSpecified(params)) return (IHooks.afterSwap.selector, 0);
+        int128 ethDelta = delta.amount0();
+        uint256 amount = uint256(int256(ethDelta < 0 ? -ethDelta : ethDelta));
+        uint256 fee = _accrue(key, amount);
+        return (IHooks.afterSwap.selector, fee.toInt128());
+    }
+
+    /// @dev ETH is always currency0. It is the specified currency when zeroForOne and exact-in, or oneForZero and
+    ///      exact-out.
+    function _ethIsSpecified(SwapParams calldata params) internal pure returns (bool) {
+        return params.zeroForOne == (params.amountSpecified < 0);
+    }
+
+    /// @dev Computes the fee, mints the hook ERC-6909 ETH claims for it (balancing the delta the hook returns to the
+    ///      PoolManager) and credits the owner and the platform.
+    function _accrue(PoolKey calldata key, uint256 amount) internal returns (uint256 fee) {
+        PoolId id = key.toId();
+        PoolConfig memory cfg = poolConfig[id];
+        fee = amount * cfg.feeBps / BPS;
+        if (fee == 0) return 0;
+        poolManager.mint(address(this), CurrencyLibrary.ADDRESS_ZERO.toId(), fee);
+        uint256 protocolAmount = fee * cfg.protocolShareBps / BPS;
+        uint256 ownerAmount = fee - protocolAmount;
+        owed[cfg.owner] += ownerAmount;
+        if (protocolAmount > 0) owed[protocolRecipient] += protocolAmount;
+        emit FeeAccrued(id, cfg.owner, ownerAmount, protocolAmount);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Unused hook callbacks
+    // ---------------------------------------------------------------------------------------------------------------
+
+    function afterInitialize(address, PoolKey calldata, uint160, int24) external pure returns (bytes4) {
+        revert HookNotImplemented();
+    }
+
+    function beforeAddLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
+        external
+        pure
+        returns (bytes4)
+    {
+        revert HookNotImplemented();
+    }
+
+    function afterAddLiquidity(
+        address,
+        PoolKey calldata,
+        ModifyLiquidityParams calldata,
+        BalanceDelta,
+        BalanceDelta,
+        bytes calldata
+    ) external pure returns (bytes4, BalanceDelta) {
+        revert HookNotImplemented();
+    }
+
+    function beforeRemoveLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
+        external
+        pure
+        returns (bytes4)
+    {
+        revert HookNotImplemented();
+    }
+
+    function afterRemoveLiquidity(
+        address,
+        PoolKey calldata,
+        ModifyLiquidityParams calldata,
+        BalanceDelta,
+        BalanceDelta,
+        bytes calldata
+    ) external pure returns (bytes4, BalanceDelta) {
+        revert HookNotImplemented();
+    }
+
+    function beforeDonate(address, PoolKey calldata, uint256, uint256, bytes calldata) external pure returns (bytes4) {
+        revert HookNotImplemented();
+    }
+
+    function afterDonate(address, PoolKey calldata, uint256, uint256, bytes calldata) external pure returns (bytes4) {
+        revert HookNotImplemented();
+    }
+}
