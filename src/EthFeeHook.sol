@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
@@ -9,7 +8,7 @@ import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {SafeCast} from "@uniswap/v4-core/src/libraries/SafeCast.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
-import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
+import {CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {
     BeforeSwapDelta,
@@ -18,58 +17,80 @@ import {
 } from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
 import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 
+import {IProtocolConfig} from "./interfaces/IProtocolConfig.sol";
+
 /// @title EthFeeHook
-/// @notice Uniswap v4 hook that charges a fee of up to 5% on every swap in native-ETH pools created by the
-///         TokenFactory. The fee is always taken on the ETH side of the swap (ETH in on buys, ETH out on sells),
-///         so the token owner is paid in ETH without any token -> ETH conversion.
+/// @notice Uniswap v4 hook that charges a fee on every swap in native-ETH pools created by the TokenFactory. The fee is
+///         always taken on the ETH side of the swap (ETH in on buys, ETH out on sells), so it is always paid in ETH.
+///
+///         fee = creator fee (0-5%, can only be lowered)          -> creator, minus the protocol share (max 10%)
+///             + sniper fee (decays to 0 shortly after launch)    -> protocol
+///
+///         The sniper fee makes the total fee start at `sniperStartFeeBps` (e.g. 80%) at launch and decay
+///         exponentially to the creator fee over `sniperDuration` seconds (e.g. 15s).
 /// @dev    Fees are accrued as ERC-6909 ETH claims on the PoolManager (no ETH moves during the swap, so a swap can
-///         never fail because a fee recipient rejects ETH) and are paid out in ETH through `claim`.
+///         never fail because a fee recipient rejects ETH) and are paid out in ETH through `claim`/`claimProtocol`.
 ///         One hook instance serves every pool the factory creates: a v4 hook's permissions are encoded in its
 ///         address, so a per-token hook would need a fresh CREATE2 salt mined for every launch.
 contract EthFeeHook is IHooks, IUnlockCallback {
     using SafeCast for uint256;
-    using SafeCast for int256;
 
-    /// @notice Maximum swap fee a token owner can set: 5%.
+    /// @notice Maximum creator fee: 5%.
     uint16 public constant MAX_FEE_BPS = 500;
-    /// @notice Maximum share of the swap fee the platform can take: 50%.
-    uint16 public constant MAX_PROTOCOL_SHARE_BPS = 5_000;
+    /// @notice Maximum share of the creator fee paid to the platform: 10%.
+    uint16 public constant MAX_PROTOCOL_SHARE_BPS = 1_000;
+    /// @notice Maximum total fee at launch while sniper protection is active: 90%.
+    uint16 public constant MAX_SNIPER_FEE_BPS = 9_000;
+    uint32 public constant MAX_SNIPER_DURATION = 10 minutes;
+    uint8 public constant MAX_SNIPER_HALVINGS = 32;
     uint256 internal constant BPS = 10_000;
+    uint256 internal constant ONE = 1e18;
 
     IPoolManager public immutable poolManager;
-    /// @notice The factory allowed to create pools with this hook. Its owner administers the protocol fee.
+    /// @notice The factory allowed to create pools with this hook. It supplies the protocol fee recipient.
     address public immutable factory;
 
+    struct SniperConfig {
+        /// Total fee at the launch timestamp, in bps. No sniper fee if it is <= the creator fee.
+        uint16 startFeeBps;
+        /// Seconds after launch at which the sniper fee reaches 0.
+        uint32 duration;
+        /// Steepness: how many times the sniper fee halves over `duration` before being scaled to hit 0 exactly.
+        uint8 halvings;
+    }
+
     struct PoolConfig {
-        address owner; // receives the fee, may lower it
-        uint16 feeBps; // fee on the ETH side of every swap
-        uint16 protocolShareBps; // share of the fee paid to the platform, fixed at pool creation
+        address owner; // receives the creator fee, may lower it
+        uint16 feeBps; // creator fee on the ETH side of every swap
+        uint16 protocolShareBps; // share of the creator fee paid to the platform, fixed at pool creation
         bool registered;
+        uint40 launchTime;
+        SniperConfig sniper;
     }
 
     mapping(PoolId => PoolConfig) public poolConfig;
-    /// @notice ETH owed to each fee recipient, claimable with `claim`.
+    /// @notice ETH owed to each pool owner, claimable with `claim`.
     mapping(address => uint256) public owed;
+    /// @notice ETH owed to the platform, paid to the factory's current protocol recipient by `claimProtocol`.
+    uint256 public protocolOwed;
 
-    /// @notice Protocol share applied to pools registered from now on.
-    uint16 public protocolShareBps;
-    address public protocolRecipient;
-
-    event PoolRegistered(PoolId indexed poolId, address indexed owner, uint16 feeBps, uint16 protocolShareBps);
+    event PoolRegistered(
+        PoolId indexed poolId, address indexed owner, uint16 feeBps, uint16 protocolShareBps, SniperConfig sniper
+    );
     event FeeLowered(PoolId indexed poolId, uint16 oldFeeBps, uint16 newFeeBps);
     event PoolOwnershipTransferred(PoolId indexed poolId, address indexed previousOwner, address indexed newOwner);
     event FeeAccrued(PoolId indexed poolId, address indexed owner, uint256 ownerAmount, uint256 protocolAmount);
     event Claimed(address indexed recipient, uint256 amount);
-    event ProtocolFeeUpdated(uint16 shareBps, address recipient);
+    event ProtocolClaimed(address indexed recipient, uint256 amount);
 
     error NotPoolManager();
     error NotFactory();
-    error NotFactoryOwner();
     error NotPoolOwner();
     error PoolNotRegistered();
     error PoolAlreadyRegistered();
     error NotNativePool();
     error FeeTooHigh();
+    error InvalidSniperConfig();
     error FeeNotLowered();
     error InvalidRecipient();
     error NothingToClaim();
@@ -80,10 +101,9 @@ contract EthFeeHook is IHooks, IUnlockCallback {
         _;
     }
 
-    constructor(IPoolManager _poolManager, address _factory, address _protocolRecipient, uint16 _protocolShareBps) {
+    constructor(IPoolManager _poolManager, address _factory) {
         poolManager = _poolManager;
         factory = _factory;
-        _setProtocolFee(_protocolShareBps, _protocolRecipient);
         Hooks.validateHookPermissions(IHooks(address(this)), getHookPermissions());
     }
 
@@ -107,41 +127,49 @@ contract EthFeeHook is IHooks, IUnlockCallback {
     }
 
     // ---------------------------------------------------------------------------------------------------------------
-    // Factory / admin
+    // Factory
     // ---------------------------------------------------------------------------------------------------------------
 
     /// @notice Registers the fee config for a pool. Must be called by the factory before it initializes the pool.
-    function registerPool(PoolKey calldata key, address owner, uint16 feeBps) external {
+    ///         The launch time (start of sniper protection) is the current block timestamp.
+    function registerPool(
+        PoolKey calldata key,
+        address owner,
+        uint16 feeBps,
+        uint16 protocolShareBps,
+        SniperConfig calldata sniper
+    ) external {
         if (msg.sender != factory) revert NotFactory();
         if (!key.currency0.isAddressZero()) revert NotNativePool();
-        if (feeBps > MAX_FEE_BPS) revert FeeTooHigh();
+        if (feeBps > MAX_FEE_BPS || protocolShareBps > MAX_PROTOCOL_SHARE_BPS) revert FeeTooHigh();
+        validateSniperConfig(sniper);
         if (owner == address(0)) revert InvalidRecipient();
         PoolId id = key.toId();
         if (poolConfig[id].registered) revert PoolAlreadyRegistered();
-        uint16 share = protocolShareBps;
-        poolConfig[id] = PoolConfig({owner: owner, feeBps: feeBps, protocolShareBps: share, registered: true});
-        emit PoolRegistered(id, owner, feeBps, share);
+        poolConfig[id] = PoolConfig({
+            owner: owner,
+            feeBps: feeBps,
+            protocolShareBps: protocolShareBps,
+            registered: true,
+            launchTime: uint40(block.timestamp),
+            sniper: sniper
+        });
+        emit PoolRegistered(id, owner, feeBps, protocolShareBps, sniper);
     }
 
-    /// @notice Sets the platform's share of swap fees for pools created from now on. Existing pools keep theirs.
-    function setProtocolFee(uint16 shareBps, address recipient) external {
-        if (msg.sender != Ownable(factory).owner()) revert NotFactoryOwner();
-        _setProtocolFee(shareBps, recipient);
-    }
-
-    function _setProtocolFee(uint16 shareBps, address recipient) internal {
-        if (shareBps > MAX_PROTOCOL_SHARE_BPS) revert FeeTooHigh();
-        if (recipient == address(0)) revert InvalidRecipient();
-        protocolShareBps = shareBps;
-        protocolRecipient = recipient;
-        emit ProtocolFeeUpdated(shareBps, recipient);
+    function validateSniperConfig(SniperConfig calldata s) public pure {
+        if (s.startFeeBps > MAX_SNIPER_FEE_BPS || s.duration > MAX_SNIPER_DURATION || s.halvings > MAX_SNIPER_HALVINGS)
+        {
+            revert InvalidSniperConfig();
+        }
+        if (s.startFeeBps > 0 && (s.duration == 0 || s.halvings == 0)) revert InvalidSniperConfig();
     }
 
     // ---------------------------------------------------------------------------------------------------------------
     // Pool owner
     // ---------------------------------------------------------------------------------------------------------------
 
-    /// @notice Lowers the pool's swap fee. The fee can never be raised.
+    /// @notice Lowers the pool's creator fee. The fee can never be raised.
     function lowerFee(PoolId id, uint16 newFeeBps) external {
         PoolConfig storage cfg = poolConfig[id];
         if (msg.sender != cfg.owner) revert NotPoolOwner();
@@ -151,7 +179,7 @@ contract EthFeeHook is IHooks, IUnlockCallback {
         emit FeeLowered(id, old, newFeeBps);
     }
 
-    /// @notice Transfers the right to receive (and lower) the pool's fee.
+    /// @notice Transfers the right to receive (and lower) the pool's creator fee.
     function transferPoolOwnership(PoolId id, address newOwner) external {
         PoolConfig storage cfg = poolConfig[id];
         if (msg.sender != cfg.owner) revert NotPoolOwner();
@@ -161,20 +189,63 @@ contract EthFeeHook is IHooks, IUnlockCallback {
     }
 
     // ---------------------------------------------------------------------------------------------------------------
+    // Fee views
+    // ---------------------------------------------------------------------------------------------------------------
+
+    /// @notice Fee currently charged by a pool, in bps of the ETH side of a swap.
+    /// @return totalBps Creator fee + sniper fee.
+    /// @return sniperBps The part of `totalBps` that is the sniper fee.
+    function currentFee(PoolId id) public view returns (uint256 totalBps, uint256 sniperBps) {
+        PoolConfig storage cfg = poolConfig[id];
+        uint256 base = cfg.feeBps;
+        SniperConfig memory s = cfg.sniper;
+        uint256 elapsed = block.timestamp - cfg.launchTime;
+        if (s.startFeeBps > base && elapsed < s.duration) {
+            sniperBps = (s.startFeeBps - base) * _decay(elapsed, s.duration, s.halvings) / ONE;
+        }
+        totalBps = base + sniperBps;
+    }
+
+    /// @dev Normalized exponential decay from 1 (t = 0) to exactly 0 (t = T), 1e18 fixed point:
+    ///      (2^(-k*t/T) - 2^(-k)) / (1 - 2^(-k)).
+    function _decay(uint256 t, uint256 T, uint256 k) internal pure returns (uint256) {
+        uint256 floor = _exp2neg(k * ONE);
+        return (_exp2neg(k * t * ONE / T) - floor) * ONE / (ONE - floor);
+    }
+
+    /// @dev 2^(-x) for x in 1e18 fixed point. Exact at integer x, linear in between (monotonically decreasing).
+    function _exp2neg(uint256 x) internal pure returns (uint256) {
+        uint256 n = x / ONE;
+        if (n >= 64) return 0;
+        uint256 whole = ONE >> n;
+        return whole - whole * (x % ONE) / (2 * ONE);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
     // Claiming
     // ---------------------------------------------------------------------------------------------------------------
 
-    /// @notice Pays out the caller's accrued fees in ETH.
+    /// @notice Pays out the caller's accrued creator fees in ETH.
     function claim() external returns (uint256) {
-        return _claim(msg.sender);
+        return _claimOwner(msg.sender);
     }
 
-    /// @notice Pays out `recipient`'s accrued fees in ETH to `recipient`. Callable by anyone (e.g. a keeper).
+    /// @notice Pays out `recipient`'s accrued creator fees in ETH to `recipient`. Callable by anyone.
     function claimFor(address recipient) external returns (uint256) {
-        return _claim(recipient);
+        return _claimOwner(recipient);
     }
 
-    function _claim(address recipient) internal returns (uint256 amount) {
+    /// @notice Pays out the platform's accrued fees to the factory's protocol recipient. Callable by anyone.
+    function claimProtocol() external returns (uint256 amount) {
+        amount = protocolOwed;
+        if (amount == 0) revert NothingToClaim();
+        protocolOwed = 0;
+        address recipient = IProtocolConfig(factory).protocolRecipient();
+        poolManager.unlock(abi.encode(recipient, amount));
+        emit ProtocolClaimed(recipient, amount);
+    }
+
+    function _claimOwner(address recipient) internal returns (uint256 amount) {
         amount = owed[recipient];
         if (amount == 0) revert NothingToClaim();
         owed[recipient] = 0;
@@ -206,8 +277,8 @@ contract EthFeeHook is IHooks, IUnlockCallback {
     }
 
     /// @dev When ETH is the specified currency (exact-in buy / exact-out sell) the fee is taken here, on the amount the
-    ///      user specified: the caller pays `amount + fee` ETH on an exact-in buy, or receives exactly `amount` ETH
-    ///      while the pool pays out `amount + fee` on an exact-out sell.
+    ///      user specified: the caller pays `amount` ETH of which `amount - fee` is swapped on an exact-in buy, or
+    ///      receives exactly `amount` ETH while the pool pays out `amount + fee` on an exact-out sell.
     function beforeSwap(address, PoolKey calldata key, SwapParams calldata params, bytes calldata)
         external
         onlyPoolManager
@@ -246,15 +317,20 @@ contract EthFeeHook is IHooks, IUnlockCallback {
     ///      PoolManager) and credits the owner and the platform.
     function _accrue(PoolKey calldata key, uint256 amount) internal returns (uint256 fee) {
         PoolId id = key.toId();
-        PoolConfig memory cfg = poolConfig[id];
-        fee = amount * cfg.feeBps / BPS;
+        (uint256 totalBps, uint256 sniperBps) = currentFee(id);
+        fee = amount * totalBps / BPS;
         if (fee == 0) return 0;
         poolManager.mint(address(this), CurrencyLibrary.ADDRESS_ZERO.toId(), fee);
-        uint256 protocolAmount = fee * cfg.protocolShareBps / BPS;
+
+        PoolConfig storage cfg = poolConfig[id];
+        uint256 sniperAmount = amount * sniperBps / BPS;
+        uint256 creatorFee = fee - sniperAmount;
+        uint256 protocolAmount = sniperAmount + creatorFee * cfg.protocolShareBps / BPS;
         uint256 ownerAmount = fee - protocolAmount;
-        owed[cfg.owner] += ownerAmount;
-        if (protocolAmount > 0) owed[protocolRecipient] += protocolAmount;
-        emit FeeAccrued(id, cfg.owner, ownerAmount, protocolAmount);
+        address owner = cfg.owner;
+        owed[owner] += ownerAmount;
+        protocolOwed += protocolAmount;
+        emit FeeAccrued(id, owner, ownerAmount, protocolAmount);
     }
 
     // ---------------------------------------------------------------------------------------------------------------

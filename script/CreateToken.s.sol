@@ -7,11 +7,7 @@ import {TokenFactory} from "../src/TokenFactory.sol";
 
 /// @notice Launches an ERC20 through a deployed factory.
 ///
-/// Env: FACTORY (required), NAME, SYMBOL, SUPPLY (whole tokens), FEE_BPS, START_TICK, SALT
-///
-/// START_TICK sets the starting price: 1.0001^tick tokens per ETH, a multiple of 200.
-///   tick ~= ln(supply / startingMarketCapEth) / ln(1.0001)
-///   e.g. 1B supply, 10 ETH market cap -> ln(1e8)/ln(1.0001) ~= 184206 -> 184200
+/// Env: FACTORY (required), NAME, SYMBOL, SUPPLY (whole tokens), FEE_BPS, MARKET_CAP (wei of ETH), SALT
 ///
 /// forge script script/CreateToken.s.sol --rpc-url base_sepolia --account <keystore> --broadcast
 contract CreateToken is Script {
@@ -22,12 +18,12 @@ contract CreateToken is Script {
             symbol: vm.envOr("SYMBOL", string("TEST")),
             totalSupply: vm.envOr("SUPPLY", uint256(1_000_000_000)) * 1e18,
             feeBps: uint16(vm.envOr("FEE_BPS", uint256(500))),
-            startTick: int24(vm.envOr("START_TICK", int256(184_200))),
+            marketCapEth: vm.envOr("MARKET_CAP", uint256(10 ether)),
             salt: vm.envOr("SALT", bytes32(0))
         });
 
         vm.startBroadcast();
-        (token, poolId) = factory.createERC20{value: factory.creationFee()}(p);
+        (token, poolId) = factory.createERC20(p);
         vm.stopBroadcast();
 
         console.log("Token:", token);

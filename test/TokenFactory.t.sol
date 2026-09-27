@@ -10,6 +10,7 @@ import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
@@ -19,8 +20,6 @@ import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
 
 import {TokenFactory} from "../src/TokenFactory.sol";
 import {EthFeeHook} from "../src/EthFeeHook.sol";
-import {FactoryERC721} from "../src/tokens/FactoryERC721.sol";
-import {FactoryERC1155} from "../src/tokens/FactoryERC1155.sol";
 
 contract RejectsEth {
     receive() external payable {
@@ -28,16 +27,17 @@ contract RejectsEth {
     }
 }
 
-contract TokenFactoryTest is Test {
+abstract contract FactoryFixture is Test {
     using StateLibrary for IPoolManager;
 
     uint160 constant HOOK_FLAGS = uint160(
         Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
             | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
     );
-    uint16 constant PROTOCOL_SHARE = 2_000; // 20% of the swap fee
+    uint16 constant PROTOCOL_SHARE = 1_000; // 10% of the creator fee
     uint256 constant SUPPLY = 1_000_000_000 ether;
-    int24 constant START_TICK = 184_200; // ~1e8 tokens per ETH -> ~10 ETH starting market cap
+    uint256 constant MARKET_CAP = 10 ether;
+    uint32 constant SNIPER_DURATION = 15;
 
     PoolManager manager;
     TokenFactory factory;
@@ -49,38 +49,37 @@ contract TokenFactoryTest is Test {
     address creator = makeAddr("creator");
     address trader = makeAddr("trader");
 
-    function setUp() public {
+    function setUp() public virtual {
         manager = new PoolManager(address(this));
         factory = new TokenFactory(manager, platform);
         address hookAddr = address(HOOK_FLAGS | (uint160(0x4444) << 144));
-        deployCodeTo(
-            "EthFeeHook.sol:EthFeeHook", abi.encode(manager, address(factory), treasury, PROTOCOL_SHARE), hookAddr
-        );
-        hook = EthFeeHook(payable(hookAddr));
-        vm.prank(platform);
+        deployCodeTo("EthFeeHook.sol:EthFeeHook", abi.encode(manager, address(factory)), hookAddr);
+        hook = EthFeeHook(hookAddr);
+        vm.startPrank(platform);
         factory.setHook(hook);
+        factory.setProtocolConfig(treasury, PROTOCOL_SHARE);
+        vm.stopPrank();
 
         router = new PoolSwapTest(manager);
         vm.deal(creator, 100 ether);
         vm.deal(trader, 1_000 ether);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
-    // Helpers
-    // ---------------------------------------------------------------------------------------------------------------
+    function _params(uint16 feeBps) internal pure returns (TokenFactory.ERC20Params memory) {
+        return TokenFactory.ERC20Params({
+            name: "Test", symbol: "TST", totalSupply: SUPPLY, feeBps: feeBps, marketCapEth: MARKET_CAP, salt: bytes32(0)
+        });
+    }
 
+    /// @dev Launches and skips past the sniper window.
     function _launch(uint16 feeBps) internal returns (address token, PoolKey memory key) {
+        (token, key) = _launchNoWarp(feeBps);
+        vm.warp(block.timestamp + SNIPER_DURATION);
+    }
+
+    function _launchNoWarp(uint16 feeBps) internal returns (address token, PoolKey memory key) {
         vm.prank(creator);
-        (token,) = factory.createERC20(
-            TokenFactory.ERC20Params({
-                name: "Test",
-                symbol: "TST",
-                totalSupply: SUPPLY,
-                feeBps: feeBps,
-                startTick: START_TICK,
-                salt: bytes32(0)
-            })
-        );
+        (token,) = factory.createERC20(_params(feeBps));
         key = factory.poolKeyOf(token);
         vm.prank(trader);
         IERC20(token).approve(address(router), type(uint256).max);
@@ -101,12 +100,16 @@ contract TokenFactoryTest is Test {
     }
 
     function _totalOwed() internal view returns (uint256) {
-        return hook.owed(creator) + hook.owed(treasury);
+        return hook.owed(creator) + hook.protocolOwed();
     }
 
     function _assertHookSolvent() internal view {
         assertEq(manager.balanceOf(address(hook), 0), _totalOwed(), "hook claims != owed");
     }
+}
+
+contract TokenFactoryTest is FactoryFixture {
+    using StateLibrary for IPoolManager;
 
     // ---------------------------------------------------------------------------------------------------------------
     // ERC20 launch
@@ -120,32 +123,57 @@ contract TokenFactoryTest is Test {
         assertApproxEqAbs(IERC20(token).balanceOf(address(manager)), SUPPLY, 1e6);
         assertEq(IERC20(token).balanceOf(address(manager)) + IERC20(token).balanceOf(address(0xdEaD)), SUPPLY);
 
+        int24 startTick = factory.startTickFor(SUPPLY, MARKET_CAP);
         (, int24 tick,,) = IPoolManager(address(manager)).getSlot0(key.toId());
-        assertEq(tick, START_TICK);
+        assertEq(tick, startTick);
         // The position sits just below the start price: inactive until the first buy moves the tick into it.
         (uint128 posLiquidity,,) = IPoolManager(address(manager))
-            .getPositionInfo(key.toId(), address(factory), TickMath.minUsableTick(200), START_TICK, bytes32(0));
+            .getPositionInfo(key.toId(), address(factory), TickMath.minUsableTick(60), startTick, bytes32(0));
         assertGt(posLiquidity, 0);
         assertEq(address(key.hooks), address(hook));
         assertTrue(key.currency0.isAddressZero());
 
-        (address owner, uint16 feeBps, uint16 share, bool registered) = hook.poolConfig(key.toId());
+        (address owner, uint16 feeBps, uint16 share, bool registered,,) = hook.poolConfig(key.toId());
         assertEq(owner, creator);
         assertEq(feeBps, 300);
         assertEq(share, PROTOCOL_SHARE);
         assertTrue(registered);
     }
 
+    function test_startTickFor_matchesMarketCap() public view {
+        // 1B tokens at 10 ETH -> 1e8 tokens per ETH -> tick ln(1e8)/ln(1.0001) = 184206.8 -> nearest multiple of 60
+        assertEq(factory.startTickFor(SUPPLY, MARKET_CAP), 184_200);
+        // price below 1 token per ETH gives a negative tick: 1M tokens at 10M ETH -> ln(0.1)/ln(1.0001) = -23027
+        assertEq(factory.startTickFor(1_000_000 ether, 10_000_000 ether), -23_040);
+    }
+
+    function testFuzz_startTickFor_within03Percent(uint128 supply, uint128 marketCap) public view {
+        supply = uint128(bound(supply, 1e18, 1e36));
+        marketCap = uint128(bound(marketCap, 1e12, 1e27));
+        int24 tick;
+        try factory.startTickFor(supply, marketCap) returns (int24 t) {
+            tick = t;
+        } catch {
+            return; // out of the usable price range
+        }
+        // implied market cap = supply / price, price = (sqrtP / 2^96)^2 tokens per ETH
+        uint256 sqrtP = TickMath.getSqrtPriceAtTick(tick);
+        uint256 priceX128 = FullMath.mulDiv(sqrtP, sqrtP, 1 << 64);
+        uint256 implied = FullMath.mulDiv(supply, 1 << 128, priceX128);
+        assertApproxEqRel(implied, marketCap, 0.0031e18);
+    }
+
+    function test_startTickFor_reverts() public {
+        vm.expectRevert(TokenFactory.InvalidMarketCap.selector);
+        factory.startTickFor(SUPPLY, 0);
+        vm.expectRevert(TokenFactory.InvalidMarketCap.selector);
+        factory.startTickFor(1, type(uint128).max);
+    }
+
     function test_createERC20_revertsOnFeeAbove5Percent() public {
         vm.prank(creator);
         vm.expectRevert(EthFeeHook.FeeTooHigh.selector);
-        factory.createERC20(TokenFactory.ERC20Params("T", "T", SUPPLY, 501, START_TICK, bytes32(0)));
-    }
-
-    function test_createERC20_revertsOnUnalignedTick() public {
-        vm.prank(creator);
-        vm.expectRevert(TokenFactory.InvalidStartTick.selector);
-        factory.createERC20(TokenFactory.ERC20Params("T", "T", SUPPLY, 100, START_TICK + 1, bytes32(0)));
+        factory.createERC20(_params(501));
     }
 
     function test_createERC20_predictedAddress() public {
@@ -157,12 +185,12 @@ contract TokenFactoryTest is Test {
     function test_createERC20_sameSaltDifferentCreators() public {
         _launch(100);
         vm.prank(trader);
-        (address token,) = factory.createERC20(TokenFactory.ERC20Params("T", "T", SUPPLY, 100, START_TICK, bytes32(0)));
+        (address token,) = factory.createERC20(_params(100));
         assertEq(token, factory.predictAddress(TokenFactory.TokenType.ERC20, trader, bytes32(0)));
     }
 
     // ---------------------------------------------------------------------------------------------------------------
-    // Swap fees
+    // Swap fees (after the sniper window)
     // ---------------------------------------------------------------------------------------------------------------
 
     function test_buyExactIn_feeOnEthInput() public {
@@ -175,8 +203,8 @@ contract TokenFactoryTest is Test {
         assertGt(IERC20(token).balanceOf(trader), 0);
         uint256 fee = 1 ether * 500 / 10_000;
         assertEq(_totalOwed(), fee);
-        assertEq(hook.owed(treasury), fee * PROTOCOL_SHARE / 10_000);
-        assertEq(hook.owed(creator), fee - hook.owed(treasury));
+        assertEq(hook.protocolOwed(), fee * PROTOCOL_SHARE / 10_000);
+        assertEq(hook.owed(creator), fee - hook.protocolOwed());
         _assertHookSolvent();
     }
 
@@ -191,7 +219,6 @@ contract TokenFactoryTest is Test {
         uint256 received = trader.balance - ethBefore;
 
         uint256 sellFee = _totalOwed() - owedAfterBuy;
-        // fee = floor(gross * 5%), received = gross - fee
         assertEq(sellFee, (received + sellFee) * 500 / 10_000);
         assertGt(sellFee, 0);
         _assertHookSolvent();
@@ -228,13 +255,15 @@ contract TokenFactoryTest is Test {
         assertEq(_totalOwed(), 0);
     }
 
-    function testFuzz_buyAndSell(uint96 buyAmount, uint16 feeBps) public {
+    function testFuzz_buyAndSell(uint96 buyAmount, uint16 feeBps, uint8 secondsAfterLaunch) public {
         feeBps = uint16(bound(feeBps, 0, 500));
         uint256 amountIn = bound(buyAmount, 1e9, 500 ether);
-        (address token, PoolKey memory key) = _launch(feeBps);
+        (address token, PoolKey memory key) = _launchNoWarp(feeBps);
+        vm.warp(block.timestamp + bound(secondsAfterLaunch, 0, 30));
 
+        (uint256 totalBps,) = hook.currentFee(key.toId());
         _swap(key, true, -int256(amountIn), amountIn);
-        assertEq(_totalOwed(), amountIn * feeBps / 10_000);
+        assertEq(_totalOwed(), amountIn * totalBps / 10_000);
 
         _swap(key, false, -int256(IERC20(token).balanceOf(trader)), 0);
         _assertHookSolvent();
@@ -247,6 +276,90 @@ contract TokenFactoryTest is Test {
             hook.claim();
             assertEq(creator.balance - before, creatorOwed);
         }
+        if (hook.protocolOwed() > 0) hook.claimProtocol();
+        assertEq(manager.balanceOf(address(hook), 0), 0);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Sniper protection
+    // ---------------------------------------------------------------------------------------------------------------
+
+    function test_sniper_fullFeeAtLaunch() public {
+        (, PoolKey memory key) = _launchNoWarp(500);
+        (uint256 totalBps, uint256 sniperBps) = hook.currentFee(key.toId());
+        assertEq(totalBps, 8_000);
+        assertEq(sniperBps, 7_500);
+
+        _swap(key, true, -1 ether, 1 ether);
+        assertEq(_totalOwed(), 0.8 ether);
+        // sniper part (75%) -> protocol; creator fee (5%) split 90/10
+        uint256 creatorFee = 0.05 ether;
+        assertEq(hook.protocolOwed(), 0.75 ether + creatorFee * PROTOCOL_SHARE / 10_000);
+        assertEq(hook.owed(creator), creatorFee - creatorFee * PROTOCOL_SHARE / 10_000);
+        _assertHookSolvent();
+    }
+
+    function test_sniper_exponentialDecay() public {
+        (, PoolKey memory key) = _launchNoWarp(500);
+        uint256 launch = block.timestamp;
+
+        // 5 halvings over 15s: at t = 3s the raw curve is 2^-1 -> (0.5 - 1/32) / (1 - 1/32) = 15/31
+        vm.warp(launch + 3);
+        (, uint256 sniperBps) = hook.currentFee(key.toId());
+        assertEq(sniperBps, uint256(7_500) * 15 / 31);
+
+        uint256 prev = type(uint256).max;
+        for (uint256 t; t < SNIPER_DURATION; ++t) {
+            vm.warp(launch + t);
+            (uint256 totalBps,) = hook.currentFee(key.toId());
+            assertLt(totalBps, prev, "strictly decreasing");
+            assertGt(totalBps, 500, "above base before the end");
+            prev = totalBps;
+        }
+        vm.warp(launch + SNIPER_DURATION);
+        (uint256 endBps, uint256 endSniper) = hook.currentFee(key.toId());
+        assertEq(endBps, 500);
+        assertEq(endSniper, 0);
+    }
+
+    function test_sniper_appliesToSellsToo() public {
+        (address token, PoolKey memory key) = _launchNoWarp(0);
+        _swap(key, true, -1 ether, 1 ether);
+        uint256 afterBuy = hook.protocolOwed();
+        _swap(key, false, -int256(IERC20(token).balanceOf(trader)), 0);
+        assertGt(hook.protocolOwed(), afterBuy);
+        assertEq(hook.owed(creator), 0);
+    }
+
+    function test_sniper_configChangeOnlyAffectsNewPools() public {
+        (, PoolKey memory oldKey) = _launchNoWarp(500);
+
+        vm.prank(platform);
+        factory.setSniperConfig(EthFeeHook.SniperConfig({startFeeBps: 0, duration: 0, halvings: 0}));
+
+        (uint256 oldBps,) = hook.currentFee(oldKey.toId());
+        assertEq(oldBps, 8_000);
+
+        vm.prank(trader);
+        (address t2,) = factory.createERC20(_params(300));
+        (uint256 newBps, uint256 newSniper) = hook.currentFee(factory.poolKeyOf(t2).toId());
+        assertEq(newBps, 300);
+        assertEq(newSniper, 0);
+    }
+
+    function test_setSniperConfig_validatesAndOnlyOwner() public {
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
+        factory.setSniperConfig(EthFeeHook.SniperConfig(8_000, 15, 5));
+
+        vm.startPrank(platform);
+        vm.expectRevert(EthFeeHook.InvalidSniperConfig.selector);
+        factory.setSniperConfig(EthFeeHook.SniperConfig(9_001, 15, 5));
+        vm.expectRevert(EthFeeHook.InvalidSniperConfig.selector);
+        factory.setSniperConfig(EthFeeHook.SniperConfig(8_000, 0, 5));
+        vm.expectRevert(EthFeeHook.InvalidSniperConfig.selector);
+        factory.setSniperConfig(EthFeeHook.SniperConfig(8_000, 601, 5));
+        factory.setSniperConfig(EthFeeHook.SniperConfig(5_000, 60, 3));
+        vm.stopPrank();
     }
 
     // ---------------------------------------------------------------------------------------------------------------
@@ -258,15 +371,14 @@ contract TokenFactoryTest is Test {
         _swap(key, true, -2 ether, 2 ether);
 
         uint256 creatorOwed = hook.owed(creator);
-        uint256 treasuryOwed = hook.owed(treasury);
+        uint256 protocolOwed = hook.protocolOwed();
 
         vm.prank(creator);
         hook.claim();
         assertEq(creator.balance, 100 ether + creatorOwed);
 
-        // anyone can push fees to a recipient
-        hook.claimFor(treasury);
-        assertEq(treasury.balance, treasuryOwed);
+        hook.claimProtocol();
+        assertEq(treasury.balance, protocolOwed);
 
         assertEq(_totalOwed(), 0);
         assertEq(manager.balanceOf(address(hook), 0), 0);
@@ -274,6 +386,19 @@ contract TokenFactoryTest is Test {
         vm.expectRevert(EthFeeHook.NothingToClaim.selector);
         vm.prank(creator);
         hook.claim();
+        vm.expectRevert(EthFeeHook.NothingToClaim.selector);
+        hook.claimProtocol();
+    }
+
+    function test_claimProtocol_paysCurrentRecipient() public {
+        (, PoolKey memory key) = _launch(500);
+        _swap(key, true, -1 ether, 1 ether);
+        address newTreasury = makeAddr("newTreasury");
+        vm.prank(platform);
+        factory.setProtocolConfig(newTreasury, 0);
+        uint256 amount = hook.protocolOwed();
+        hook.claimProtocol();
+        assertEq(newTreasury.balance, amount);
     }
 
     function test_recipientRejectingEthDoesNotBlockSwaps() public {
@@ -288,7 +413,6 @@ contract TokenFactoryTest is Test {
 
         vm.expectRevert();
         hook.claimFor(address(bad));
-        // failed claim leaves the balance intact
         assertGt(hook.owed(address(bad)), 0);
     }
 
@@ -302,7 +426,7 @@ contract TokenFactoryTest is Test {
 
         vm.prank(creator);
         hook.lowerFee(id, 100);
-        (, uint16 feeBps,,) = hook.poolConfig(id);
+        (, uint16 feeBps,,,,) = hook.poolConfig(id);
         assertEq(feeBps, 100);
 
         _swap(key, true, -1 ether, 1 ether);
@@ -345,24 +469,28 @@ contract TokenFactoryTest is Test {
         (, PoolKey memory oldKey) = _launch(500);
 
         vm.prank(platform);
-        hook.setProtocolFee(5_000, treasury);
+        factory.setProtocolConfig(treasury, 500);
 
-        (,, uint16 oldShare,) = hook.poolConfig(oldKey.toId());
+        (,, uint16 oldShare,,,) = hook.poolConfig(oldKey.toId());
         assertEq(oldShare, PROTOCOL_SHARE);
 
         vm.prank(trader);
-        (address t2,) = factory.createERC20(TokenFactory.ERC20Params("B", "B", SUPPLY, 500, START_TICK, bytes32(0)));
-        (,, uint16 newShare,) = hook.poolConfig(factory.poolKeyOf(t2).toId());
-        assertEq(newShare, 5_000);
+        (address t2,) = factory.createERC20(_params(500));
+        (,, uint16 newShare,,,) = hook.poolConfig(factory.poolKeyOf(t2).toId());
+        assertEq(newShare, 500);
     }
 
-    function test_setProtocolFee_onlyFactoryOwnerAndCapped() public {
-        vm.expectRevert(EthFeeHook.NotFactoryOwner.selector);
-        hook.setProtocolFee(0, treasury);
+    function test_setProtocolConfig_onlyOwnerAndCappedAt10Percent() public {
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
+        factory.setProtocolConfig(treasury, 0);
 
-        vm.prank(platform);
-        vm.expectRevert(EthFeeHook.FeeTooHigh.selector);
-        hook.setProtocolFee(5_001, treasury);
+        vm.startPrank(platform);
+        vm.expectRevert(TokenFactory.ProtocolShareTooHigh.selector);
+        factory.setProtocolConfig(treasury, 1_001);
+        vm.expectRevert(TokenFactory.InvalidRecipient.selector);
+        factory.setProtocolConfig(address(0), 0);
+        factory.setProtocolConfig(treasury, 1_000);
+        vm.stopPrank();
     }
 
     // ---------------------------------------------------------------------------------------------------------------
@@ -393,99 +521,12 @@ contract TokenFactoryTest is Test {
     function test_registerPool_onlyFactory() public {
         PoolKey memory key;
         vm.expectRevert(EthFeeHook.NotFactory.selector);
-        hook.registerPool(key, creator, 100);
-    }
-
-    // ---------------------------------------------------------------------------------------------------------------
-    // Factory admin / creation fee
-    // ---------------------------------------------------------------------------------------------------------------
-
-    function test_creationFee() public {
-        vm.prank(platform);
-        factory.setCreationFee(0.01 ether);
-
-        vm.prank(creator);
-        vm.expectRevert(TokenFactory.WrongCreationFee.selector);
-        factory.createERC721("N", "N", "ipfs://x/", bytes32(0));
-
-        vm.prank(creator);
-        factory.createERC721{value: 0.01 ether}("N", "N", "ipfs://x/", bytes32(0));
-        vm.prank(creator);
-        factory.createERC20{value: 0.01 ether}(TokenFactory.ERC20Params("T", "T", SUPPLY, 100, START_TICK, bytes32(0)));
-
-        address payable to = payable(makeAddr("to"));
-        vm.prank(platform);
-        factory.withdrawFees(to);
-        assertEq(to.balance, 0.02 ether);
-    }
-
-    function test_adminFunctionsOnlyOwner() public {
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
-        factory.setCreationFee(1);
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
-        factory.withdrawFees(payable(address(this)));
+        hook.registerPool(key, creator, 100, 0, EthFeeHook.SniperConfig(0, 0, 0));
     }
 
     function test_setHook_onlyOnce() public {
         vm.prank(platform);
         vm.expectRevert(TokenFactory.HookAlreadySet.selector);
         factory.setHook(hook);
-    }
-
-    // ---------------------------------------------------------------------------------------------------------------
-    // NFTs
-    // ---------------------------------------------------------------------------------------------------------------
-
-    function test_erc721() public {
-        vm.prank(creator);
-        address c = factory.createERC721("Col", "COL", "ipfs://base/", bytes32(uint256(1)));
-        FactoryERC721 nft = FactoryERC721(c);
-        assertEq(nft.owner(), creator);
-        assertEq(nft.name(), "Col");
-        assertEq(c, factory.predictAddress(TokenFactory.TokenType.ERC721, creator, bytes32(uint256(1))));
-
-        vm.prank(creator);
-        assertEq(nft.mint(trader), 1);
-        vm.prank(creator);
-        assertEq(nft.mintBatch(trader, 3), 2);
-        assertEq(nft.balanceOf(trader), 4);
-        assertEq(nft.totalMinted(), 4);
-        assertEq(nft.tokenURI(4), "ipfs://base/4");
-
-        vm.prank(trader);
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, trader));
-        nft.mint(trader);
-
-        vm.expectRevert();
-        nft.initialize("x", "x", "x", trader);
-    }
-
-    function test_erc1155() public {
-        vm.prank(creator);
-        address c = factory.createERC1155("Items", "ITM", "ipfs://items/{id}.json", bytes32(0));
-        FactoryERC1155 items = FactoryERC1155(c);
-        assertEq(items.owner(), creator);
-        assertEq(items.name(), "Items");
-        assertEq(items.symbol(), "ITM");
-
-        vm.prank(creator);
-        items.mint(trader, 7, 100, "");
-        uint256[] memory ids = new uint256[](2);
-        uint256[] memory amounts = new uint256[](2);
-        (ids[0], ids[1], amounts[0], amounts[1]) = (1, 2, 10, 20);
-        vm.prank(creator);
-        items.mintBatch(trader, ids, amounts, "");
-        assertEq(items.balanceOf(trader, 7), 100);
-        assertEq(items.balanceOf(trader, 2), 20);
-
-        vm.prank(trader);
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, trader));
-        items.mint(trader, 1, 1, "");
-    }
-
-    function test_implementationsCannotBeInitialized() public {
-        FactoryERC721 impl = FactoryERC721(factory.erc721Implementation());
-        vm.expectRevert();
-        impl.initialize("x", "x", "x", trader);
     }
 }

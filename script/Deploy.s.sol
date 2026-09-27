@@ -14,8 +14,7 @@ import {EthFeeHook} from "../src/EthFeeHook.sol";
 /// Env:
 ///   POOL_MANAGER         Uniswap v4 PoolManager (default: Base Sepolia 0x05E7...3408)
 ///   PROTOCOL_RECIPIENT   receives the platform's share of swap fees (default: deployer)
-///   PROTOCOL_SHARE_BPS   platform share of each swap fee, max 5000 (default: 0)
-///   CREATION_FEE         flat ETH fee in wei per token created (default: 0)
+///   PROTOCOL_SHARE_BPS   platform share of creator swap fees and NFT mint revenue, max 1000 (default: 0)
 ///   FACTORY_OWNER        final owner of the factory (default: deployer)
 ///
 /// forge script script/Deploy.s.sol --rpc-url base_sepolia --account <keystore> --broadcast --verify
@@ -35,21 +34,20 @@ contract Deploy is Script {
         (, address deployer,) = vm.readCallers();
         address protocolRecipient = vm.envOr("PROTOCOL_RECIPIENT", deployer);
         uint16 protocolShareBps = uint16(vm.envOr("PROTOCOL_SHARE_BPS", uint256(0)));
-        uint256 creationFee = vm.envOr("CREATION_FEE", uint256(0));
         address finalOwner = vm.envOr("FACTORY_OWNER", deployer);
 
         factory = new TokenFactory(poolManager, deployer);
 
         // A v4 hook's permissions are encoded in the low 14 bits of its address: mine a CREATE2 salt that yields
         // an address with exactly our flags. Forge routes `new X{salt: ...}` through the CREATE2 deployer proxy.
-        bytes memory args = abi.encode(poolManager, address(factory), protocolRecipient, protocolShareBps);
+        bytes memory args = abi.encode(poolManager, address(factory));
         (address expected, bytes32 salt) =
             HookMiner.find(CREATE2_FACTORY, HOOK_FLAGS, type(EthFeeHook).creationCode, args);
-        hook = new EthFeeHook{salt: salt}(poolManager, address(factory), protocolRecipient, protocolShareBps);
+        hook = new EthFeeHook{salt: salt}(poolManager, address(factory));
         require(address(hook) == expected, "hook address mismatch");
 
         factory.setHook(hook);
-        if (creationFee > 0) factory.setCreationFee(creationFee);
+        factory.setProtocolConfig(protocolRecipient, protocolShareBps);
         if (finalOwner != deployer) factory.transferOwnership(finalOwner);
         vm.stopBroadcast();
 
