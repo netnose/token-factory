@@ -42,7 +42,6 @@ contract Handler is Test {
     uint256 public ghostOwnerClaimed;
     uint256 public ghostPlatformWithdrawn;
     uint256 public ghostSwaps;
-    uint256 public ghostPartialFills;
 
     constructor(PoolManager _manager, TokenFactory _factory, EthFeeHook _hook, address _platform) {
         manager = _manager;
@@ -197,13 +196,11 @@ contract Handler is Test {
         (uint256 bps,) = hook.currentFee(key.toId());
         uint256 ethBefore = actor.balance;
         uint256 before = feeClaims();
-        // Reverts if the actor lacks tokens. If the pool holds less ETH than asked, v4 fills the exact-out swap only
-        // partially (possibly with nothing), so the seller can receive less than `amount` - never more.
+        // Reverts if the actor lacks tokens, or if the pool holds less ETH than asked (the hook rejects partial
+        // fills), so a successful exact-out sell always delivers exactly `amount`.
         if (!_swap(actor, key, false, int256(amount), 0)) return;
         uint256 fee = feeClaims() - before;
-        uint256 received = actor.balance - ethBefore;
-        assertLe(received, amount, "exact-out sell: more ETH than asked");
-        if (received < amount) ghostPartialFills++;
+        assertEq(actor.balance - ethBefore, amount, "exact-out sell: exact ETH out");
         // The fee is on the specified amount (charged before the swap runs).
         assertEq(fee, amount * bps / BPS, "exact-out sell fee");
         ghostFeesCharged += fee;

@@ -85,6 +85,13 @@ import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/Pool
 ///   | sell, exact ETH out   | specified   | beforeSwap  | receives exactly X ETH; pool pays out X + fee (more     |
 ///   |                       |             |             | tokens are sold)                                        |
 ///
+///   All-or-nothing when ETH is specified: in those two rows the fee is fixed before the swap runs (a delta on the
+///   specified leg can only be returned from beforeSwap), so if the swap then filled only partly - a price limit
+///   stopped it early, or a sell asked for more ETH than the pool holds - the user would pay the fee on ETH that was
+///   never swapped. afterSwap therefore reverts such swaps with `PartialFill`. Uniswap's own router applies the same
+///   rule to exact-output swaps and never sets a price limit, so normal trades are unaffected. (The factory's
+///   launch buy is exempt: it is fee-free and stops at the 10% owner cap on purpose.)
+///
 /// ====================================================================================================================
 ///  WHERE THE MONEY GOES
 /// ====================================================================================================================
@@ -182,6 +189,8 @@ contract EthFeeHook is IHooks, IUnlockCallback {
     error InvalidRecipient();
     error NothingToClaim();
     error HookNotImplemented();
+    /// @notice A swap with a fixed ETH amount did not fill completely (see `_requireFullFill`).
+    error PartialFill(uint256 expectedEth, uint256 actualEth);
 
     /// @dev Hook callbacks and the unlock callback must only be triggered by the PoolManager itself.
     modifier onlyPoolManager() {
@@ -399,9 +408,8 @@ contract EthFeeHook is IHooks, IUnlockCallback {
     ///      Returning (+fee) as the specified delta makes the PoolManager adjust the swap by `fee`:
     ///        exact-in buy  (amountSpecified = -X): the pool swaps only X - fee; the user still pays X.
     ///        exact-out sell (amountSpecified = +X): the pool pays out X + fee; the user still receives X.
-    ///      The fee is on the amount the user specified. If the swap then fills only partly - a price limit stops it
-    ///      early, or an exact-out sell asks for more ETH than the pool holds - the fee is still on the full specified
-    ///      amount: a delta on the specified leg can only be returned here, before the fill is known.
+    ///      The fee is on the amount the user specified. A delta on the specified leg can only be returned here,
+    ///      before the fill is known, so afterSwap reverts the swap if it then fills only partly (`PartialFill`).
     ///      `sender` is the contract that called `poolManager.swap`; the factory's own launch buy pays no fee.
     function beforeSwap(address sender, PoolKey calldata key, SwapParams calldata params, bytes calldata)
         external
@@ -418,10 +426,13 @@ contract EthFeeHook is IHooks, IUnlockCallback {
         return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
-    /// @dev Charges the fee when ETH is the UNSPECIFIED leg (exact-in sell, exact-out buy), after the swap has run and
-    ///      the ETH amount is known. `delta.amount0()` is that ETH amount from the swapper's view (negative = paid in,
-    ///      positive = received). Returning (+fee) makes the PoolManager charge the swapper `fee` more ETH on an
-    ///      exact-out buy, or pay them `fee` less ETH on an exact-in sell.
+    /// @dev Runs after the swap, when the ETH amount is known. `delta` is the pool's swap result before the hook's
+    ///      cut, from the swapper's view: `delta.amount0()` is the ETH leg (negative = paid in, positive = received).
+    ///      - ETH was the UNSPECIFIED leg (exact-in sell, exact-out buy): charge the fee now, on that ETH amount.
+    ///        Returning (+fee) makes the PoolManager charge the swapper `fee` more ETH on an exact-out buy, or pay
+    ///        them `fee` less ETH on an exact-in sell.
+    ///      - ETH was the SPECIFIED leg: the fee was charged in beforeSwap; only check the swap filled completely.
+    ///      - The factory's launch buy: nothing to do (fee-free, and it stops at the owner cap on purpose).
     function afterSwap(
         address sender,
         PoolKey calldata key,
@@ -429,12 +440,30 @@ contract EthFeeHook is IHooks, IUnlockCallback {
         BalanceDelta delta,
         bytes calldata
     ) external onlyPoolManager returns (bytes4, int128) {
-        // Already charged in beforeSwap, or the factory's fee-free launch buy.
-        if (sender == factory || _ethIsSpecified(params)) return (IHooks.afterSwap.selector, 0);
+        if (sender == factory) return (IHooks.afterSwap.selector, 0);
         int128 ethDelta = delta.amount0();
-        uint256 amount = uint256(int256(ethDelta < 0 ? -ethDelta : ethDelta));
-        uint256 fee = _accrue(key, amount);
+        uint256 ethAmount = uint256(int256(ethDelta < 0 ? -ethDelta : ethDelta));
+        if (_ethIsSpecified(params)) {
+            _requireFullFill(key, params, ethAmount);
+            return (IHooks.afterSwap.selector, 0);
+        }
+        uint256 fee = _accrue(key, ethAmount);
         return (IHooks.afterSwap.selector, fee.toInt128());
+    }
+
+    /// @dev For a swap where ETH was specified, checks the pool moved exactly the ETH beforeSwap told it to:
+    ///        exact-in buy  (specified X): the pool must take in  X - fee
+    ///        exact-out sell (specified X): the pool must pay out X + fee
+    ///      Otherwise the swap filled only partly and the fee (charged on all of X) would include ETH that was never
+    ///      swapped, so it reverts. `fee` is recomputed exactly as beforeSwap computed it: same pool, same block, and
+    ///      nothing can change the pool's fee config in between.
+    function _requireFullFill(PoolKey calldata key, SwapParams calldata params, uint256 ethAmount) internal view {
+        uint256 specified =
+            params.amountSpecified < 0 ? uint256(-params.amountSpecified) : uint256(params.amountSpecified);
+        (uint256 totalBps,) = currentFee(key.toId());
+        uint256 fee = specified * totalBps / BPS;
+        uint256 expected = params.amountSpecified < 0 ? specified - fee : specified + fee;
+        if (ethAmount != expected) revert PartialFill(expected, ethAmount);
     }
 
     /// @dev Whether ETH (currency0) is the leg the user fixed. The specified leg is the input on exact-in swaps and

@@ -67,6 +67,8 @@ With a 5% creator fee, the total fee over time is:
 | Sell, exact tokens in | `afterSwap` | You receive the swap output − fee. |
 | Sell, exact ETH out | `beforeSwap` | You receive exactly X ETH, and the swap sells enough tokens to cover X + fee. |
 
+When ETH is the fixed amount (the first and last rows), the swap must fill completely, or it reverts with `PartialFill`. Otherwise the fee, which was set before the swap ran, would include ETH that never got swapped.
+
 **Owner controls:** `lowerFee` lowers the fee and can never raise it. `transferPoolOwnership` sends future fees to a new address.
 
 **Payout:** each fee is split between the creator and the platform at swap time, as ERC-6909 ETH claims on the PoolManager.
@@ -174,7 +176,10 @@ GitHub Actions runs format check, build and the CI profile on every push and pul
 
 ## Known trade-offs
 
-- **Fee on partial fills:** when ETH is the amount the user fixes (buying with exactly X ETH, or selling for exactly X ETH), the fee is charged on X before the swap runs. If the swap then fills only partly, the fee still covers all of X. That happens when a price limit stops the swap early, or when a sell asks for more ETH than the pool holds. Normal routers don't set limits like that.
+- **All-or-nothing when ETH is fixed:** buying with exactly X ETH, or selling for exactly X ETH, must fill completely, or the swap reverts with `PartialFill`.
+  - The fee on these swaps is fixed before the swap runs, so a partial fill would charge the fee on ETH that was never swapped.
+  - Uniswap's own router already applies this rule to exact-output swaps, and it never sets a price limit, so normal trades never hit it.
+  - Anyone who wants a partial fill can fix the token amount instead of the ETH amount.
 - **Empty price region:** above the launch price the pool has no liquidity. A sell there moves the price for free and fills nothing, which is standard Uniswap v4 behavior. The next buy moves back through the empty region at no cost, so buyers aren't harmed.
 - **Fee avoidance:** anyone can create a separate pool for the same token without our hook and trade there fee-free. Every fee-by-hook design has this weakness; only a transfer tax built into the token is enforced everywhere.
 - **NFT limits:** per-wallet mint limits can be dodged by using several wallets. The default royalty receiver is set at creation and doesn't follow ownership transfers.

@@ -289,33 +289,50 @@ contract TokenFactoryTest is FactoryFixture {
         _assertHookSolvent();
     }
 
-    /// @dev Documents partial fills: an exact-in buy stopped early by a price limit. The unswapped ETH is returned;
-    ///      the only overcharge is the fee on the part that did not fill (fee is on the specified 10 ETH).
-    function test_partialFill_exactInBuy_refundsUnswappedEth() public {
+    /// @dev An exact-in buy stopped early by a price limit would pay the fee on ETH that was never swapped:
+    ///      the hook reverts it, and nothing changes hands.
+    function test_partialFill_exactInBuy_reverts() public {
         (, PoolKey memory key) = _launch(500);
         (uint160 sqrtStart,,,) = IPoolManager(address(manager)).getSlot0(key.toId());
         uint256 ethBefore = trader.balance;
-        uint256 poolEthBefore = address(manager).balance;
 
         vm.prank(trader);
+        vm.expectRevert(); // PartialFill, wrapped by the PoolManager
         router.swap{value: 10 ether}(
             key,
             SwapParams({zeroForOne: true, amountSpecified: -10 ether, sqrtPriceLimitX96: sqrtStart * 99 / 100}),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
         );
+        assertEq(trader.balance, ethBefore);
+        assertEq(_totalOwed(), 0);
+    }
 
-        uint256 paid = ethBefore - trader.balance;
-        uint256 fee = _totalOwed();
-        uint256 swapped = address(manager).balance - poolEthBefore - fee; // ETH that actually went into the pool
-        assertEq(fee, 0.5 ether, "fee on the full 10 ETH");
-        assertEq(paid, swapped + fee, "paid = swapped + fee; the rest came back");
-        assertLt(paid, 10 ether, "unswapped ETH refunded");
-        emit log_named_decimal_uint("sent       ", 10 ether, 18);
-        emit log_named_decimal_uint("swapped    ", swapped, 18);
-        emit log_named_decimal_uint("fee charged", fee, 18);
-        emit log_named_decimal_uint("fair fee   ", swapped * 500 / 9_500, 18);
-        emit log_named_decimal_uint("refunded   ", 10 ether - paid, 18);
+    /// @dev A price limit that the swap never reaches is fine: it fills completely.
+    function test_priceLimitNotReached_exactInBuySucceeds() public {
+        (, PoolKey memory key) = _launch(500);
+        (uint160 sqrtStart,,,) = IPoolManager(address(manager)).getSlot0(key.toId());
+        vm.prank(trader);
+        router.swap{value: 0.01 ether}(
+            key,
+            SwapParams({zeroForOne: true, amountSpecified: -0.01 ether, sqrtPriceLimitX96: sqrtStart * 99 / 100}),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        assertEq(_totalOwed(), 0.01 ether * 500 / 10_000);
+    }
+
+    /// @dev An exact-out sell asking for more ETH than the pool holds would only partly fill: reverts.
+    function test_partialFill_exactOutSell_reverts() public {
+        (address token, PoolKey memory key) = _launch(500);
+        _swap(key, true, -1 ether, 1 ether); // the pool now holds 0.95 ETH of liquidity
+        uint256 tokensBefore = IERC20(token).balanceOf(trader);
+
+        vm.expectRevert();
+        _swap(key, false, 2 ether, 0);
+        assertEq(IERC20(token).balanceOf(trader), tokensBefore);
+
+        _swap(key, false, 0.5 ether, 0); // within what the pool holds: fills exactly
     }
 
     function test_zeroFeePoolTakesNothing() public {
