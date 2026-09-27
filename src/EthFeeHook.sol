@@ -18,22 +18,94 @@ import {
 import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 
 /// @title EthFeeHook
-/// @notice Uniswap v4 hook that charges a fee on every swap in native-ETH pools created by the TokenFactory. The fee is
-///         always taken on the ETH side of the swap (ETH in on buys, ETH out on sells), so it is always paid in ETH.
+/// @notice Uniswap v4 hook that charges a fee, always in ETH, on every swap in the ETH/TOKEN pools launched by the
+///         TokenFactory.
 ///
-///         fee = creator fee (0-5%, can only be lowered)          -> creator, minus the protocol share (max 10%)
-///             + sniper fee (decays to 0 shortly after launch)    -> protocol
+/// ====================================================================================================================
+///  WHAT IT CHARGES
+/// ====================================================================================================================
 ///
-///         The protocol's part is credited to the factory immediately, as ERC-6909 ETH claims on the PoolManager, so
-///         the factory owner can withdraw all platform revenue in one call. Swaps made by the factory itself (the
-///         creator's launch buy) pay no fee.
+///   fee = amount of ETH in or out of the swap  x  (creator fee + sniper fee)
 ///
-///         The sniper fee makes the total fee start at `sniperStartFeeBps` (e.g. 80%) at launch and decay
-///         exponentially to the creator fee over `sniperDuration` seconds (e.g. 15s).
-/// @dev    Fees are accrued as ERC-6909 ETH claims on the PoolManager (no ETH moves during the swap, so a swap can
-///         never fail because a fee recipient rejects ETH) and creators are paid out in ETH through `claim`.
-///         One hook instance serves every pool the factory creates: a v4 hook's permissions are encoded in its
-///         address, so a per-token hook would need a fresh CREATE2 salt mined for every launch.
+///   - creator fee: 0-5%, chosen by the creator at launch. The pool owner can lower it, never raise it.
+///                  The platform takes `protocolShareBps` (max 10%) of it; the rest goes to the pool owner.
+///   - sniper fee:  only right after launch. The total fee starts at e.g. 80% and decays to the creator fee over
+///                  e.g. 15 seconds, so bots buying in the first blocks pay heavily. All of it goes to the platform.
+///                  See `currentFee` for the curve.
+///
+///   Example: creator fee 5%, platform share 10%, 15s after launch, someone buys with 1 ETH:
+///     fee = 0.05 ETH -> 0.045 ETH to the pool owner, 0.005 ETH to the platform; 0.95 ETH is swapped into tokens.
+///
+///   Swaps made by the factory itself pay nothing: that is how the creator's capped launch buy is fee-free.
+///
+/// ====================================================================================================================
+///  UNISWAP V4 BACKGROUND (what the code relies on)
+/// ====================================================================================================================
+///
+///   Hooks & permissions  A pool names a hook contract in its PoolKey. The PoolManager calls the hook around pool
+///                        actions, but only the ones enabled by flag bits in the low 14 bits of the hook's ADDRESS.
+///                        This contract must be deployed (via a mined CREATE2 salt) at an address whose bits enable
+///                        exactly: beforeInitialize, beforeSwap, afterSwap, beforeSwapReturnDelta and
+///                        afterSwapReturnDelta. The constructor checks it.
+///
+///   Currencies           ETH is represented as address(0). Pools sort their two currencies, so ETH is always
+///                        currency0 and the token is always currency1.
+///
+///   Swap direction       zeroForOne = true  means currency0 -> currency1, i.e. ETH -> token: a BUY.
+///                        zeroForOne = false means token -> ETH: a SELL.
+///
+///   Exact in / out       amountSpecified < 0: exact input  ("I pay exactly X").
+///                        amountSpecified > 0: exact output ("I receive exactly X").
+///                        The "specified" currency is the one the user fixed; the other is "unspecified" (computed).
+///
+///   Deltas               The PoolManager keeps a running balance ("delta") per address and currency during a
+///                        transaction; everything must net to zero before it ends. A hook can take a cut of a swap
+///                        by returning a delta:
+///                          - beforeSwap returns one on the SPECIFIED currency (it can shrink or grow the swap),
+///                          - afterSwap returns one on the UNSPECIFIED currency (after the swap result is known).
+///                        A positive hook delta means "the hook is owed this": the PoolManager charges the swapper
+///                        that much more (or pays them that much less) and credits the hook.
+///
+///   ERC-6909 claims      Instead of receiving ETH, the hook balances its credit by minting itself (or the factory)
+///                        ERC-6909 claim tokens on the PoolManager, redeemable 1:1 for ETH later. No ETH moves during
+///                        the swap, which (a) works even if the PoolManager does not hold the swapper's ETH yet at that
+///                        point, and (b) means a fee recipient that rejects ETH can never make a swap fail.
+///
+/// ====================================================================================================================
+///  WHERE THE FEE IS TAKEN
+/// ====================================================================================================================
+///
+///   The fee is always computed on the ETH leg. Which callback takes it depends on whether ETH is the specified leg:
+///
+///   | swap                  | ETH leg     | taken in    | effect for the user                                     |
+///   |-----------------------|-------------|-------------|---------------------------------------------------------|
+///   | buy,  exact ETH in    | specified   | beforeSwap  | pays exactly X ETH; X - fee is swapped                  |
+///   | buy,  exact tokens out| unspecified | afterSwap   | gets exactly N tokens; pays their cost + fee            |
+///   | sell, exact tokens in | unspecified | afterSwap   | receives the ETH the swap produced - fee                |
+///   | sell, exact ETH out   | specified   | beforeSwap  | receives exactly X ETH; pool pays out X + fee (more     |
+///   |                       |             |             | tokens are sold)                                        |
+///
+/// ====================================================================================================================
+///  WHERE THE MONEY GOES
+/// ====================================================================================================================
+///
+///   - Pool owner's part: ERC-6909 ETH claims minted to THIS contract and recorded in `owed[owner]`.
+///                        Paid out in ETH by `claim()` / `claimFor(owner)`.
+///   - Platform's part:   ERC-6909 ETH claims minted straight to the FACTORY during the swap. The factory owner
+///                        withdraws them (with all other platform revenue) in one call.
+///   Invariant: this contract's ERC-6909 ETH balance == sum of `owed`.
+///
+/// ====================================================================================================================
+///  TRUST MODEL
+/// ====================================================================================================================
+///
+///   - Only the factory can create pools with this hook (`beforeInitialize`), and it registers each pool's config
+///     first. The config is fixed at launch: the platform cannot change an existing pool's fee, protocol share or
+///     sniper settings. Only the pool owner can change anything, and only by lowering the creator fee or handing
+///     ownership to another address.
+///   - There is no admin, no upgradeability and no way to move owners' funds except to the owner.
+///   - One hook instance serves every pool: a hook's permissions live in its address, so a hook per token would need
+///     a new mined address per launch (and a new Uniswap routing allowlist entry each time).
 contract EthFeeHook is IHooks, IUnlockCallback {
     using SafeCast for uint256;
 
@@ -41,37 +113,52 @@ contract EthFeeHook is IHooks, IUnlockCallback {
     uint16 public constant MAX_FEE_BPS = 500;
     /// @notice Maximum share of the creator fee paid to the platform: 10%.
     uint16 public constant MAX_PROTOCOL_SHARE_BPS = 1_000;
-    /// @notice Maximum total fee at launch while sniper protection is active: 90%.
+    /// @notice Maximum total fee at the moment of launch while sniper protection is active: 90%.
     uint16 public constant MAX_SNIPER_FEE_BPS = 9_000;
+    /// @notice Longest allowed sniper-protection window.
     uint32 public constant MAX_SNIPER_DURATION = 10 minutes;
+    /// @notice Steepest allowed sniper curve (see `SniperConfig.halvings`).
     uint8 public constant MAX_SNIPER_HALVINGS = 32;
+    /// @dev Basis-point denominator: 10_000 bps = 100%.
     uint256 internal constant BPS = 10_000;
+    /// @dev 1.0 in 18-decimal fixed point, used by the decay curve.
     uint256 internal constant ONE = 1e18;
 
     IPoolManager public immutable poolManager;
-    /// @notice The factory allowed to create pools with this hook. Receives the protocol's share of every fee.
+    /// @notice The factory: the only address allowed to create pools with this hook, the recipient of the platform's
+    ///         share of every fee, and the only swapper that pays no fee (its capped launch buy).
     address public immutable factory;
 
+    /// @notice Sniper protection settings, chosen by the platform and copied into each pool at launch.
     struct SniperConfig {
-        /// Total fee at the launch timestamp, in bps. No sniper fee if it is <= the creator fee.
+        /// Total fee (creator fee + sniper fee) at the launch timestamp, in bps. 0 (or anything <= the creator fee)
+        /// disables sniper protection for the pool.
         uint16 startFeeBps;
-        /// Seconds after launch at which the sniper fee reaches 0.
+        /// Seconds after launch at which the sniper fee reaches exactly 0.
         uint32 duration;
-        /// Steepness: how many times the sniper fee halves over `duration` before being scaled to hit 0 exactly.
+        /// Curve steepness: the sniper fee halves `halvings` times over `duration` (then the curve is rescaled so it
+        /// lands exactly on 0). Higher = drops faster early on. E.g. 5 halvings over 15s = one halving every 3s.
         uint8 halvings;
     }
 
+    /// @notice Per-pool settings, written once by the factory at launch.
     struct PoolConfig {
-        address owner; // receives the creator fee, may lower it
-        uint16 feeBps; // creator fee on the ETH side of every swap
-        uint16 protocolShareBps; // share of the creator fee paid to the platform, fixed at pool creation
+        /// Receives the pool owner's part of the fee; the only address that can lower the fee or transfer ownership.
+        address owner;
+        /// Creator fee in bps of the ETH leg of every swap. Can only go down.
+        uint16 feeBps;
+        /// Platform share of the creator fee, in bps. Fixed at launch.
+        uint16 protocolShareBps;
+        /// True once the factory has registered the pool.
         bool registered;
+        /// Timestamp of the launch: the start of the sniper-protection window.
         uint40 launchTime;
+        /// Sniper protection for this pool. Fixed at launch.
         SniperConfig sniper;
     }
 
     mapping(PoolId => PoolConfig) public poolConfig;
-    /// @notice ETH owed to each pool owner, claimable with `claim`.
+    /// @notice ETH owed to each pool owner, claimable with `claim`. Backed 1:1 by this contract's ERC-6909 ETH claims.
     mapping(address => uint256) public owed;
 
     event PoolRegistered(
@@ -79,6 +166,7 @@ contract EthFeeHook is IHooks, IUnlockCallback {
     );
     event FeeLowered(PoolId indexed poolId, uint16 oldFeeBps, uint16 newFeeBps);
     event PoolOwnershipTransferred(PoolId indexed poolId, address indexed previousOwner, address indexed newOwner);
+    /// @notice Emitted on every charged swap. `ownerAmount + protocolAmount` is the total fee in wei of ETH.
     event FeeAccrued(PoolId indexed poolId, address indexed owner, uint256 ownerAmount, uint256 protocolAmount);
     event Claimed(address indexed recipient, uint256 amount);
 
@@ -95,17 +183,23 @@ contract EthFeeHook is IHooks, IUnlockCallback {
     error NothingToClaim();
     error HookNotImplemented();
 
+    /// @dev Hook callbacks and the unlock callback must only be triggered by the PoolManager itself.
     modifier onlyPoolManager() {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
         _;
     }
 
+    /// @dev Reverts unless this contract was deployed at an address whose flag bits match `getHookPermissions`.
     constructor(IPoolManager _poolManager, address _factory) {
         poolManager = _poolManager;
         factory = _factory;
         Hooks.validateHookPermissions(IHooks(address(this)), getHookPermissions());
     }
 
+    /// @notice The callbacks this hook uses. Must match the flag bits of the deployment address.
+    ///         - beforeInitialize:       only the factory may create pools with this hook.
+    ///         - beforeSwap / afterSwap: charge the fee (on the specified / unspecified ETH leg respectively).
+    ///         - *ReturnDelta:           allow those two callbacks to take a cut of the swap by returning a delta.
     function getHookPermissions() public pure returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
             beforeInitialize: true,
@@ -125,12 +219,17 @@ contract EthFeeHook is IHooks, IUnlockCallback {
         });
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
+    // =================================================================================================================
     // Factory
-    // ---------------------------------------------------------------------------------------------------------------
+    // =================================================================================================================
 
-    /// @notice Registers the fee config for a pool. Must be called by the factory before it initializes the pool.
-    ///         The launch time (start of sniper protection) is the current block timestamp.
+    /// @notice Records a new pool's fee config. Called by the factory right before it initializes the pool (the
+    ///         `beforeInitialize` callback rejects pools that were not registered). Starts the sniper window now.
+    /// @param key              The pool; must be native ETH (currency0 = address(0)) paired with the token.
+    /// @param owner            Pool owner: receives the owner's part of the fee and may lower the fee.
+    /// @param feeBps           Creator fee, max MAX_FEE_BPS.
+    /// @param protocolShareBps Platform share of the creator fee, max MAX_PROTOCOL_SHARE_BPS.
+    /// @param sniper           Sniper protection settings (see `validateSniperConfig`).
     function registerPool(
         PoolKey calldata key,
         address owner,
@@ -139,6 +238,7 @@ contract EthFeeHook is IHooks, IUnlockCallback {
         SniperConfig calldata sniper
     ) external {
         if (msg.sender != factory) revert NotFactory();
+        // The fee logic assumes ETH is currency0 (it always is when one side is native ETH).
         if (!key.currency0.isAddressZero()) revert NotNativePool();
         if (feeBps > MAX_FEE_BPS || protocolShareBps > MAX_PROTOCOL_SHARE_BPS) revert FeeTooHigh();
         validateSniperConfig(sniper);
@@ -156,6 +256,8 @@ contract EthFeeHook is IHooks, IUnlockCallback {
         emit PoolRegistered(id, owner, feeBps, protocolShareBps, sniper);
     }
 
+    /// @notice Reverts if a sniper config is out of bounds: start fee above 90%, window above 10 minutes, more than 32
+    ///         halvings, or an enabled config (start fee > 0) with a zero window or zero halvings.
     function validateSniperConfig(SniperConfig calldata s) public pure {
         if (s.startFeeBps > MAX_SNIPER_FEE_BPS || s.duration > MAX_SNIPER_DURATION || s.halvings > MAX_SNIPER_HALVINGS)
         {
@@ -164,11 +266,11 @@ contract EthFeeHook is IHooks, IUnlockCallback {
         if (s.startFeeBps > 0 && (s.duration == 0 || s.halvings == 0)) revert InvalidSniperConfig();
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
+    // =================================================================================================================
     // Pool owner
-    // ---------------------------------------------------------------------------------------------------------------
+    // =================================================================================================================
 
-    /// @notice Lowers the pool's creator fee. The fee can never be raised.
+    /// @notice Lowers the pool's creator fee. Takes effect on the next swap. The fee can never be raised.
     function lowerFee(PoolId id, uint16 newFeeBps) external {
         PoolConfig storage cfg = poolConfig[id];
         if (msg.sender != cfg.owner) revert NotPoolOwner();
@@ -178,7 +280,8 @@ contract EthFeeHook is IHooks, IUnlockCallback {
         emit FeeLowered(id, old, newFeeBps);
     }
 
-    /// @notice Transfers the right to receive (and lower) the pool's creator fee.
+    /// @notice Hands the pool's ownership (future fees + the right to lower the fee) to `newOwner`. Fees already
+    ///         accrued stay claimable by the previous owner.
     function transferPoolOwnership(PoolId id, address newOwner) external {
         PoolConfig storage cfg = poolConfig[id];
         if (msg.sender != cfg.owner) revert NotPoolOwner();
@@ -187,13 +290,24 @@ contract EthFeeHook is IHooks, IUnlockCallback {
         emit PoolOwnershipTransferred(id, msg.sender, newOwner);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
+    // =================================================================================================================
     // Fee views
-    // ---------------------------------------------------------------------------------------------------------------
+    // =================================================================================================================
 
-    /// @notice Fee currently charged by a pool, in bps of the ETH side of a swap.
-    /// @return totalBps Creator fee + sniper fee.
-    /// @return sniperBps The part of `totalBps` that is the sniper fee.
+    /// @notice Fee a pool charges right now, in bps of the ETH leg of a swap.
+    ///
+    ///         While the sniper window is open (t = seconds since launch < T = duration):
+    ///           sniperBps = (startFeeBps - creatorFee) * decay(t)
+    ///           decay(t)  = (2^(-k*t/T) - 2^(-k)) / (1 - 2^(-k))        k = halvings
+    ///         decay(0) = 1, so the total fee at launch is exactly `startFeeBps`; decay(T) = 0, so the total lands
+    ///         exactly on the creator fee at the end of the window. In between it falls fast first, then flattens.
+    ///
+    ///         With the defaults (80% start, 15s, 5 halvings) and a 5% creator fee the total fee is:
+    ///           t:     0s    2s     4s     6s     8s     10s    12s   15s
+    ///           fee:   80%   54.2%  34.8%  21.9%  15.5%  10.6%  7.4%  5%
+    ///
+    /// @return totalBps  Creator fee + sniper fee.
+    /// @return sniperBps The sniper part of `totalBps` (all of it goes to the platform).
     function currentFee(PoolId id) public view returns (uint256 totalBps, uint256 sniperBps) {
         PoolConfig storage cfg = poolConfig[id];
         uint256 base = cfg.feeBps;
@@ -205,35 +319,41 @@ contract EthFeeHook is IHooks, IUnlockCallback {
         totalBps = base + sniperBps;
     }
 
-    /// @dev Normalized exponential decay from 1 (t = 0) to exactly 0 (t = T), 1e18 fixed point:
-    ///      (2^(-k*t/T) - 2^(-k)) / (1 - 2^(-k)).
+    /// @dev decay(t) = (2^(-k*t/T) - 2^(-k)) / (1 - 2^(-k)) in 1e18 fixed point. Subtracting 2^(-k) and dividing by
+    ///      (1 - 2^(-k)) rescales the plain exponential so it starts at exactly 1 and ends at exactly 0 instead of
+    ///      stopping at 2^(-k) and then jumping to 0. Requires t < T and k >= 1 (guaranteed by the caller / config).
     function _decay(uint256 t, uint256 T, uint256 k) internal pure returns (uint256) {
         uint256 floor = _exp2neg(k * ONE);
         return (_exp2neg(k * t * ONE / T) - floor) * ONE / (ONE - floor);
     }
 
-    /// @dev 2^(-x) for x in 1e18 fixed point. Exact at integer x, linear in between (monotonically decreasing).
+    /// @dev 2^(-x) for x in 1e18 fixed point. Exact at whole numbers (1, 1/2, 1/4, ...) and a straight line between
+    ///      them, which keeps it cheap, strictly decreasing, and within ~6% of the true curve.
     function _exp2neg(uint256 x) internal pure returns (uint256) {
-        uint256 n = x / ONE;
+        uint256 n = x / ONE; // whole halvings
         if (n >= 64) return 0;
-        uint256 whole = ONE >> n;
+        uint256 whole = ONE >> n; // 2^(-n)
+        // Between 2^(-n) and 2^(-n-1) = whole/2, move linearly by the fractional part of x.
         return whole - whole * (x % ONE) / (2 * ONE);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
-    // Claiming
-    // ---------------------------------------------------------------------------------------------------------------
+    // =================================================================================================================
+    // Claiming (pool owners)
+    // =================================================================================================================
 
     /// @notice Pays out the caller's accrued creator fees in ETH.
     function claim() external returns (uint256) {
         return _claimOwner(msg.sender);
     }
 
-    /// @notice Pays out `recipient`'s accrued creator fees in ETH to `recipient`. Callable by anyone.
+    /// @notice Pays out `recipient`'s accrued creator fees, in ETH, to `recipient` (never anywhere else), so anyone
+    ///         can trigger it, e.g. a keeper.
     function claimFor(address recipient) external returns (uint256) {
         return _claimOwner(recipient);
     }
 
+    /// @dev Zeroes the balance before calling out (checks-effects-interactions). If the recipient rejects ETH the
+    ///      whole call reverts and the balance stays intact.
     function _claimOwner(address recipient) internal returns (uint256 amount) {
         amount = owed[recipient];
         if (amount == 0) revert NothingToClaim();
@@ -242,7 +362,8 @@ contract EthFeeHook is IHooks, IUnlockCallback {
         emit Claimed(recipient, amount);
     }
 
-    /// @dev Converts the hook's ERC-6909 ETH claims back into ETH and sends it to the recipient.
+    /// @dev Runs inside `poolManager.unlock` during a claim: redeems `amount` of this contract's ERC-6909 ETH claims
+    ///      (burn credits us) and sends that ETH to the recipient (take debits us), netting to zero.
     function unlockCallback(bytes calldata data) external onlyPoolManager returns (bytes memory) {
         (address recipient, uint256 amount) = abi.decode(data, (address, uint256));
         poolManager.burn(address(this), CurrencyLibrary.ADDRESS_ZERO.toId(), amount);
@@ -250,10 +371,12 @@ contract EthFeeHook is IHooks, IUnlockCallback {
         return "";
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
+    // =================================================================================================================
     // Hook callbacks
-    // ---------------------------------------------------------------------------------------------------------------
+    // =================================================================================================================
 
+    /// @dev Pool creation gate: only the factory may create pools that use this hook, and only after registering
+    ///      them. `sender` is whoever called `poolManager.initialize`.
     function beforeInitialize(address sender, PoolKey calldata key, uint160)
         external
         view
@@ -265,9 +388,13 @@ contract EthFeeHook is IHooks, IUnlockCallback {
         return IHooks.beforeInitialize.selector;
     }
 
-    /// @dev When ETH is the specified currency (exact-in buy / exact-out sell) the fee is taken here, on the amount the
-    ///      user specified: the caller pays `amount` ETH of which `amount - fee` is swapped on an exact-in buy, or
-    ///      receives exactly `amount` ETH while the pool pays out `amount + fee` on an exact-out sell.
+    /// @dev Charges the fee when ETH is the SPECIFIED leg (exact-in buy, exact-out sell), before the swap runs.
+    ///      Returning (+fee) as the specified delta makes the PoolManager adjust the swap by `fee`:
+    ///        exact-in buy  (amountSpecified = -X): the pool swaps only X - fee; the user still pays X.
+    ///        exact-out sell (amountSpecified = +X): the pool pays out X + fee; the user still receives X.
+    ///      The fee is on the amount the user specified. (If the user also sets a price limit that stops the swap
+    ///      early, the fee is still on the full specified amount; routers do not normally do that.)
+    ///      `sender` is the contract that called `poolManager.swap`; the factory's own launch buy pays no fee.
     function beforeSwap(address sender, PoolKey calldata key, SwapParams calldata params, bytes calldata)
         external
         onlyPoolManager
@@ -277,13 +404,16 @@ contract EthFeeHook is IHooks, IUnlockCallback {
             uint256 amount =
                 params.amountSpecified < 0 ? uint256(-params.amountSpecified) : uint256(params.amountSpecified);
             uint256 fee = _accrue(key, amount);
+            // toBeforeSwapDelta(specified, unspecified); the third return value (LP fee override) is unused.
             if (fee > 0) return (IHooks.beforeSwap.selector, toBeforeSwapDelta(fee.toInt128(), 0), 0);
         }
         return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
-    /// @dev When ETH is the unspecified currency (exact-in sell / exact-out buy) the fee is taken here, on the ETH
-    ///      amount the swap actually produced: the seller receives `out - fee`, the buyer pays `in + fee`.
+    /// @dev Charges the fee when ETH is the UNSPECIFIED leg (exact-in sell, exact-out buy), after the swap has run and
+    ///      the ETH amount is known. `delta.amount0()` is that ETH amount from the swapper's view (negative = paid in,
+    ///      positive = received). Returning (+fee) makes the PoolManager charge the swapper `fee` more ETH on an
+    ///      exact-out buy, or pay them `fee` less ETH on an exact-in sell.
     function afterSwap(
         address sender,
         PoolKey calldata key,
@@ -291,6 +421,7 @@ contract EthFeeHook is IHooks, IUnlockCallback {
         BalanceDelta delta,
         bytes calldata
     ) external onlyPoolManager returns (bytes4, int128) {
+        // Already charged in beforeSwap, or the factory's fee-free launch buy.
         if (sender == factory || _ethIsSpecified(params)) return (IHooks.afterSwap.selector, 0);
         int128 ethDelta = delta.amount0();
         uint256 amount = uint256(int256(ethDelta < 0 ? -ethDelta : ethDelta));
@@ -298,14 +429,23 @@ contract EthFeeHook is IHooks, IUnlockCallback {
         return (IHooks.afterSwap.selector, fee.toInt128());
     }
 
-    /// @dev ETH is always currency0. It is the specified currency when zeroForOne and exact-in, or oneForZero and
-    ///      exact-out.
+    /// @dev Whether ETH (currency0) is the leg the user fixed. The specified leg is the input on exact-in swaps and
+    ///      the output on exact-out swaps, so ETH is specified on buys that are exact-in (zeroForOne && amount < 0)
+    ///      and on sells that are exact-out (!zeroForOne && amount > 0).
     function _ethIsSpecified(SwapParams calldata params) internal pure returns (bool) {
         return params.zeroForOne == (params.amountSpecified < 0);
     }
 
-    /// @dev Computes the fee and mints ERC-6909 ETH claims for it (balancing the delta the hook returns to the
-    ///      PoolManager): the owner's part to this hook, credited to `owed`; the protocol's part straight to the factory.
+    /// @dev Computes and books the fee on `amount` wei of ETH.
+    ///
+    ///        fee            = amount * (creator + sniper bps)        total the swapper pays
+    ///        sniperAmount   = amount * sniper bps                    -> platform
+    ///        creatorFee     = fee - sniperAmount
+    ///        protocolAmount = sniperAmount + creatorFee * share      -> platform (minted to the factory)
+    ///        ownerAmount    = fee - protocolAmount                   -> pool owner (minted to this hook, `owed`)
+    ///
+    ///      The hook returns `fee` as its delta, which the PoolManager credits to the hook; minting ERC-6909 claims
+    ///      debits the hook by the same total, so the hook's balance with the PoolManager nets to zero.
     function _accrue(PoolKey calldata key, uint256 amount) internal returns (uint256 fee) {
         PoolId id = key.toId();
         (uint256 totalBps, uint256 sniperBps) = currentFee(id);
@@ -326,9 +466,11 @@ contract EthFeeHook is IHooks, IUnlockCallback {
         emit FeeAccrued(id, owner, ownerAmount, protocolAmount);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
+    // =================================================================================================================
     // Unused hook callbacks
-    // ---------------------------------------------------------------------------------------------------------------
+    // =================================================================================================================
+    // Required by the IHooks interface. The PoolManager never calls them because their permission bits are not set
+    // in this contract's address; they revert in case anything else does.
 
     function afterInitialize(address, PoolKey calldata, uint160, int24) external pure returns (bytes4) {
         revert HookNotImplemented();

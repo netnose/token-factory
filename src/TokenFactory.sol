@@ -13,6 +13,7 @@ import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
+import {FixedPoint96} from "@uniswap/v4-core/src/libraries/FixedPoint96.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
@@ -49,6 +50,8 @@ contract TokenFactory is Ownable, IUnlockCallback {
     uint24 public constant POOL_LP_FEE = 0;
     int24 public constant TICK_SPACING = 60;
     uint16 public constant MAX_PROTOCOL_SHARE_BPS = 1_000;
+    /// @notice The creator's fee-free launch buy can take at most 10% of the supply.
+    uint16 public constant MAX_OWNER_BUY_BPS = 1_000;
     address internal constant DEAD = 0x000000000000000000000000000000000000dEaD;
 
     IPoolManager public immutable poolManager;
@@ -100,6 +103,17 @@ contract TokenFactory is Ownable, IUnlockCallback {
         Withdraw
     }
 
+    /// @dev Everything the unlock callback needs to seed a pool and run the launch buy.
+    struct LaunchData {
+        PoolKey key;
+        int24 tickLower;
+        int24 tickUpper;
+        uint128 liquidity;
+        uint256 totalSupply;
+        uint256 buyAmount;
+        address buyer;
+    }
+
     enum TokenType {
         ERC20,
         ERC721,
@@ -137,6 +151,7 @@ contract TokenFactory is Ownable, IUnlockCallback {
     error InvalidMarketCap();
     error NotPoolManager();
     error NotERC20();
+    error OwnerBuyTooLarge();
 
     constructor(IPoolManager _poolManager, address _owner) Ownable(_owner) {
         poolManager = _poolManager;
@@ -196,7 +211,8 @@ contract TokenFactory is Ownable, IUnlockCallback {
 
     /// @notice Creates a fixed-supply ERC20 and launches it in a one-sided ETH/TOKEN v4 pool with the fee hook.
     ///         Any ETH sent is the creator's launch buy: it is swapped into the pool right after it is created, with
-    ///         no fee (not even the sniper fee), and the tokens go to the caller. Unspent ETH is refunded.
+    ///         no fee (not even the sniper fee), and the tokens go to the caller. The buy stops once it has taken
+    ///         MAX_OWNER_BUY_BPS (10%) of the supply; ETH it did not need is refunded.
     /// @return token The new token.
     /// @return poolId The id of its v4 pool.
     function createERC20(ERC20Params calldata p) external payable returns (address token, PoolId poolId) {
@@ -236,13 +252,18 @@ contract TokenFactory is Ownable, IUnlockCallback {
         uint128 liquidity = LiquidityAmounts.getLiquidityForAmount1(
             TickMath.getSqrtPriceAtTick(minTick), TickMath.getSqrtPriceAtTick(startTick), totalSupply
         );
-        (uint256 ethSpent, uint256 tokensBought) = abi.decode(
-            poolManager.unlock(
-                abi.encode(Action.Launch, abi.encode(key, minTick, startTick, liquidity, msg.value, msg.sender))
-            ),
-            (uint256, uint256)
-        );
-        // Safety net only: the range reaches the minimum tick, so an exact-in buy is always filled in full.
+        LaunchData memory data = LaunchData({
+            key: key,
+            tickLower: minTick,
+            tickUpper: startTick,
+            liquidity: liquidity,
+            totalSupply: totalSupply,
+            buyAmount: msg.value,
+            buyer: msg.sender
+        });
+        (uint256 ethSpent, uint256 tokensBought) =
+            abi.decode(poolManager.unlock(abi.encode(Action.Launch, abi.encode(data))), (uint256, uint256));
+        // The launch buy stops at the 10% cap, so ETH beyond what that costs is returned.
         if (msg.value > ethSpent) Address.sendValue(payable(msg.sender), msg.value - ethSpent);
         if (tokensBought > 0) emit OwnerBuy(Currency.unwrap(key.currency1), msg.sender, ethSpent, tokensBought);
 
@@ -285,36 +306,48 @@ contract TokenFactory is Ownable, IUnlockCallback {
 
     /// @dev Adds the one-sided token liquidity, paid from the factory's token balance, then executes the creator's
     ///      launch buy. The hook charges no fee on swaps made by the factory.
+    ///
+    ///      Owner-buy cap: all liquidity sits in one range that holds only the token, so while buying inside it the
+    ///      token amount between two prices is linear in sqrtPrice: tokens(a -> b) = L * (sqrtA - sqrtB) / 2^96.
+    ///      The price at which exactly `cap` tokens have been bought is therefore sqrtStart - cap * 2^96 / L. Using it
+    ///      as the swap's price limit makes the exact-in swap stop there by itself (rounding the step down keeps the
+    ///      output <= cap); the ETH it did not use stays unspent and is refunded by the caller.
     function _launch(bytes memory params) internal returns (bytes memory) {
-        (PoolKey memory key, int24 tickLower, int24 tickUpper, uint128 liquidity, uint256 buyAmount, address buyer) =
-            abi.decode(params, (PoolKey, int24, int24, uint128, uint256, address));
+        LaunchData memory d = abi.decode(params, (LaunchData));
 
         (BalanceDelta delta,) = poolManager.modifyLiquidity(
-            key,
+            d.key,
             ModifyLiquidityParams({
-                tickLower: tickLower, tickUpper: tickUpper, liquidityDelta: int256(uint256(liquidity)), salt: bytes32(0)
+                tickLower: d.tickLower,
+                tickUpper: d.tickUpper,
+                liquidityDelta: int256(uint256(d.liquidity)),
+                salt: bytes32(0)
             }),
             ""
         );
 
         // The position is below the current price, so it only needs the token (amount0 == 0).
         uint256 owed = uint256(uint128(-delta.amount1()));
-        poolManager.sync(key.currency1);
-        IERC20(Currency.unwrap(key.currency1)).safeTransfer(address(poolManager), owed);
+        poolManager.sync(d.key.currency1);
+        IERC20(Currency.unwrap(d.key.currency1)).safeTransfer(address(poolManager), owed);
         poolManager.settle();
 
-        if (buyAmount == 0) return abi.encode(uint256(0), uint256(0));
+        if (d.buyAmount == 0) return abi.encode(uint256(0), uint256(0));
+
+        uint256 cap = d.totalSupply * MAX_OWNER_BUY_BPS / 10_000;
+        uint160 sqrtLimit =
+            uint160(TickMath.getSqrtPriceAtTick(d.tickUpper) - FullMath.mulDiv(cap, FixedPoint96.Q96, d.liquidity));
         BalanceDelta swapDelta = poolManager.swap(
-            key,
-            SwapParams({
-                zeroForOne: true, amountSpecified: -int256(buyAmount), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
-            }),
+            d.key,
+            SwapParams({zeroForOne: true, amountSpecified: -int256(d.buyAmount), sqrtPriceLimitX96: sqrtLimit}),
             ""
         );
         uint256 ethSpent = uint256(uint128(-swapDelta.amount0()));
         uint256 tokensBought = uint256(uint128(swapDelta.amount1()));
+        if (tokensBought > cap) revert OwnerBuyTooLarge(); // unreachable by construction; kept as a hard guarantee
+
         poolManager.settle{value: ethSpent}();
-        poolManager.take(key.currency1, buyer, tokensBought);
+        poolManager.take(d.key.currency1, d.buyer, tokensBought);
         return abi.encode(ethSpent, tokensBought);
     }
 

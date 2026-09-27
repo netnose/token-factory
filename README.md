@@ -27,6 +27,7 @@ A factory for ERC20, ERC721 and ERC1155 tokens on Uniswap v4. It targets Base Se
 5. **Owner buy:** any ETH sent with the call is swapped for the creator right away.
    - This buy pays **no fees at all**: no creator fee, no sniper fee, no platform share. The hook skips fees for swaps made by the factory, and the factory swaps only during creation.
    - The tokens go to the caller, and the buy emits an `OwnerBuy` event.
+   - The buy is **capped at 10% of the supply**. The swap is given a price limit at exactly the point where 10% has been bought, so it stops there on its own. Any ETH it didn't need is refunded.
 6. The factory owns the position and has no function to remove it, so the **liquidity is locked forever**.
 
 ## Swap fees (always in ETH)
@@ -109,6 +110,8 @@ There is no creation fee.
 
 A v4 hook's permissions live in the low 14 bits of its address, so every hook needs a mined CREATE2 salt. A separate hook per token would mean mining a salt for every launch. Instead, the protocol deploys one `EthFeeHook` and it keeps a separate fee config for each pool. Only the factory can create pools with it (`beforeInitialize`).
 
+The source of `src/EthFeeHook.sol` explains the hook in detail: the Uniswap v4 concepts it relies on, where each fee is taken and why, the sniper curve, and how the ETH is accounted for.
+
 ## Development
 
 ```bash
@@ -136,5 +139,5 @@ The deploy script mines the hook salt against the standard CREATE2 deployer, dep
 
 - On an exact-in buy with a `sqrtPriceLimit` that stops the swap early, the fee is still charged on the full amount specified. Normal routers don't set a limit like that.
 - The sniper fee is based on timestamps. On Base (2 s blocks), the window is about 7–8 blocks.
-- The creator's launch buy has no size limit and pays no fees. Buyers can see how much the creator bought through the `OwnerBuy` event.
+- The creator's launch buy pays no fees and can take up to 10% of the supply. Buyers can see how much the creator bought through the `OwnerBuy` event.
 - None of this has been audited. Get a review before deploying to mainnet.

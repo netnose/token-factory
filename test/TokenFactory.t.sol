@@ -536,9 +536,9 @@ contract TokenFactoryTest is FactoryFixture {
         assertEq(_totalOwed(), 0.8 ether);
     }
 
-    function test_ownerBuy_largeBuyFollowsCurve() public {
-        // The locked range reaches the minimum tick, so a buy is always filled in full: with virtual reserves
-        // (supply tokens, marketCap ETH) the constant-product output is supply * v / (marketCap + v).
+    function test_ownerBuy_cappedAt10PercentAndRefunded() public {
+        // 1,000 tokens at a 1 ETH market cap. Constant-product with virtual reserves (1,000 tokens, 1 ETH): taking
+        // 100 tokens (10%) costs 1 * 100 / 900 = 0.111 ETH. Sending 99 ETH must stop there and refund the rest.
         TokenFactory.ERC20Params memory p = _params(500);
         p.totalSupply = 1_000 ether;
         p.marketCapEth = 1 ether;
@@ -546,9 +546,42 @@ contract TokenFactoryTest is FactoryFixture {
         vm.prank(creator);
         (address token,) = factory.createERC20{value: 99 ether}(p);
 
-        assertEq(ethBefore - creator.balance, 99 ether);
-        assertApproxEqRel(IERC20(token).balanceOf(creator), 990 ether, 0.004e18);
+        uint256 bought = IERC20(token).balanceOf(creator);
+        uint256 spent = ethBefore - creator.balance;
+        assertLe(bought, 100 ether, "never above the cap");
+        assertApproxEqRel(bought, 100 ether, 1e12, "fills up to the cap");
+        assertApproxEqRel(spent, uint256(1 ether) * 100 / 900, 0.004e18, "pays only what the cap costs");
+        assertEq(address(factory).balance, 0, "rest refunded");
+    }
+
+    function test_ownerBuy_belowCapFillsInFull() public {
+        // 1 ETH into 1B tokens at a 10 ETH market cap buys ~1e9 / 11 = 9.1% of the supply: under the cap.
+        uint256 ethBefore = creator.balance;
+        vm.prank(creator);
+        (address token,) = factory.createERC20{value: 1 ether}(_params(500));
+        assertEq(ethBefore - creator.balance, 1 ether);
+        assertApproxEqRel(IERC20(token).balanceOf(creator), SUPPLY / 11, 0.004e18);
+    }
+
+    function testFuzz_ownerBuy_neverExceedsCap(uint96 value, uint128 supply, uint96 marketCap) public {
+        uint256 v = bound(value, 1, 100 ether);
+        TokenFactory.ERC20Params memory p = _params(500);
+        p.totalSupply = bound(supply, 1e18, 1e33);
+        p.marketCapEth = bound(marketCap, 1e15, 1e24);
+        try factory.startTickFor(p.totalSupply, p.marketCapEth) {}
+        catch {
+            return;
+        }
+        vm.deal(creator, v);
+        vm.prank(creator);
+        (address token,) = factory.createERC20{value: v}(p);
+
+        uint256 bought = IERC20(token).balanceOf(creator);
+        assertLe(bought, p.totalSupply / 10);
+        // ETH is conserved: what the creator lost is exactly what the pool manager received
+        assertEq(v - creator.balance, address(manager).balance);
         assertEq(address(factory).balance, 0);
+        assertEq(_totalOwed(), 0, "fee-free");
     }
 
     function test_noOwnerBuyWithoutValue() public {
