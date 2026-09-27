@@ -20,3 +20,17 @@ line_length = 120
 
 [lint]
 lint_on_build = false
+
+[invariant]
+runs = 64
+depth = 64
+fail_on_revert = true
+
+# Heavier fuzzing in CI (FOUNDRY_PROFILE=ci).
+[profile.ci.fuzz]
+runs = 10000
+
+[profile.ci.invariant]
+runs = 256
+depth = 128
+fail_on_revert = true

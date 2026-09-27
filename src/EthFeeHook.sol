@@ -90,7 +90,7 @@ import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/Pool
 /// ====================================================================================================================
 ///
 ///   - Pool owner's part: ERC-6909 ETH claims minted to THIS contract and recorded in `owed[owner]`.
-///                        Paid out in ETH by `claim()` / `claimFor(owner)`.
+///                        Paid out in ETH by `claim()`, `claimTo(to)` or `claimFor(owner)`.
 ///   - Platform's part:   ERC-6909 ETH claims minted straight to the FACTORY during the swap. The factory owner
 ///                        withdraws them (with all other platform revenue) in one call.
 ///   Invariant: this contract's ERC-6909 ETH balance == sum of `owed`.
@@ -168,7 +168,7 @@ contract EthFeeHook is IHooks, IUnlockCallback {
     event PoolOwnershipTransferred(PoolId indexed poolId, address indexed previousOwner, address indexed newOwner);
     /// @notice Emitted on every charged swap. `ownerAmount + protocolAmount` is the total fee in wei of ETH.
     event FeeAccrued(PoolId indexed poolId, address indexed owner, uint256 ownerAmount, uint256 protocolAmount);
-    event Claimed(address indexed recipient, uint256 amount);
+    event Claimed(address indexed owner, address indexed to, uint256 amount);
 
     error NotPoolManager();
     error NotFactory();
@@ -343,23 +343,30 @@ contract EthFeeHook is IHooks, IUnlockCallback {
 
     /// @notice Pays out the caller's accrued creator fees in ETH.
     function claim() external returns (uint256) {
-        return _claimOwner(msg.sender);
+        return _claim(msg.sender, msg.sender);
     }
 
-    /// @notice Pays out `recipient`'s accrued creator fees, in ETH, to `recipient` (never anywhere else), so anyone
-    ///         can trigger it, e.g. a keeper.
-    function claimFor(address recipient) external returns (uint256) {
-        return _claimOwner(recipient);
+    /// @notice Pays out the caller's accrued creator fees in ETH to `to`. Lets an owner that cannot receive ETH
+    ///         itself (e.g. a contract without a receive function) still get its fees out.
+    function claimTo(address to) external returns (uint256) {
+        if (to == address(0)) revert InvalidRecipient();
+        return _claim(msg.sender, to);
     }
 
-    /// @dev Zeroes the balance before calling out (checks-effects-interactions). If the recipient rejects ETH the
-    ///      whole call reverts and the balance stays intact.
-    function _claimOwner(address recipient) internal returns (uint256 amount) {
-        amount = owed[recipient];
+    /// @notice Pays out `owner`'s accrued creator fees, in ETH, to `owner` (never anywhere else), so anyone can
+    ///         trigger it, e.g. a keeper.
+    function claimFor(address owner) external returns (uint256) {
+        return _claim(owner, owner);
+    }
+
+    /// @dev Zeroes the balance before calling out (checks-effects-interactions): a recipient re-entering finds
+    ///      nothing left to claim. If the recipient rejects ETH the whole call reverts and the balance stays intact.
+    function _claim(address owner, address to) internal returns (uint256 amount) {
+        amount = owed[owner];
         if (amount == 0) revert NothingToClaim();
-        owed[recipient] = 0;
-        poolManager.unlock(abi.encode(recipient, amount));
-        emit Claimed(recipient, amount);
+        owed[owner] = 0;
+        poolManager.unlock(abi.encode(to, amount));
+        emit Claimed(owner, to, amount);
     }
 
     /// @dev Runs inside `poolManager.unlock` during a claim: redeems `amount` of this contract's ERC-6909 ETH claims
@@ -392,8 +399,9 @@ contract EthFeeHook is IHooks, IUnlockCallback {
     ///      Returning (+fee) as the specified delta makes the PoolManager adjust the swap by `fee`:
     ///        exact-in buy  (amountSpecified = -X): the pool swaps only X - fee; the user still pays X.
     ///        exact-out sell (amountSpecified = +X): the pool pays out X + fee; the user still receives X.
-    ///      The fee is on the amount the user specified. (If the user also sets a price limit that stops the swap
-    ///      early, the fee is still on the full specified amount; routers do not normally do that.)
+    ///      The fee is on the amount the user specified. If the swap then fills only partly - a price limit stops it
+    ///      early, or an exact-out sell asks for more ETH than the pool holds - the fee is still on the full specified
+    ///      amount: a delta on the specified leg can only be returned here, before the fill is known.
     ///      `sender` is the contract that called `poolManager.swap`; the factory's own launch buy pays no fee.
     function beforeSwap(address sender, PoolKey calldata key, SwapParams calldata params, bytes calldata)
         external

@@ -5,6 +5,7 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {Address} from "@openzeppelin/contracts/utils/Address.sol";
+import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
@@ -19,7 +20,7 @@ import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
-import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmounts.sol";
+import {Pool} from "@uniswap/v4-core/src/libraries/Pool.sol";
 
 import {EthFeeHook} from "./EthFeeHook.sol";
 import {FactoryERC20} from "./tokens/FactoryERC20.sol";
@@ -43,7 +44,7 @@ import {FactoryERC1155} from "./tokens/FactoryERC1155.sol";
 ///         sniper protection parameters. Both are snapshotted per token at creation, so changes never affect existing
 ///         tokens. All platform revenue lands in this contract as it is earned - swap fees as ERC-6909 ETH claims on
 ///         the PoolManager, mint revenue as ETH - and `withdraw` pays out both in one call.
-contract TokenFactory is Ownable, IUnlockCallback {
+contract TokenFactory is Ownable, ReentrancyGuardTransient, IUnlockCallback {
     using SafeERC20 for IERC20;
 
     /// @notice LP fee of launch pools. Zero: the hook fee is the only swap fee and the locked position earns nothing.
@@ -68,7 +69,7 @@ contract TokenFactory is Ownable, IUnlockCallback {
     struct ERC20Params {
         string name;
         string symbol;
-        /// Total supply in wei (18 decimals). All of it goes into the pool.
+        /// Total supply in wei (18 decimals), at most type(int128).max. All of it goes into the pool.
         uint256 totalSupply;
         /// Creator's swap fee in basis points, max 500 (5%).
         uint16 feeBps;
@@ -152,6 +153,7 @@ contract TokenFactory is Ownable, IUnlockCallback {
     error NotPoolManager();
     error NotERC20();
     error OwnerBuyTooLarge();
+    error SupplyTooLargeForPrice();
 
     constructor(IPoolManager _poolManager, address _owner) Ownable(_owner) {
         poolManager = _poolManager;
@@ -185,7 +187,7 @@ contract TokenFactory is Ownable, IUnlockCallback {
 
     /// @notice Withdraws all platform revenue: swap fees (ERC-6909 ETH claims on the PoolManager) and NFT mint
     ///         revenue (ETH held here).
-    function withdraw(address payable to) external onlyOwner returns (uint256 amount) {
+    function withdraw(address payable to) external onlyOwner nonReentrant returns (uint256 amount) {
         if (to == address(0)) revert InvalidRecipient();
         uint256 claims = poolManager.balanceOf(address(this), CurrencyLibrary.ADDRESS_ZERO.toId());
         if (claims > 0) poolManager.unlock(abi.encode(Action.Withdraw, abi.encode(to, claims)));
@@ -200,7 +202,10 @@ contract TokenFactory is Ownable, IUnlockCallback {
 
     /// @notice Sets sniper protection for ERC20s launched from now on. `startFeeBps` 0 disables it.
     function setSniperConfig(EthFeeHook.SniperConfig calldata config) external onlyOwner {
-        if (address(hook) != address(0)) hook.validateSniperConfig(config);
+        // Validated by the hook (the same check `registerPool` applies), so an invalid config can never be stored
+        // and brick launches.
+        if (address(hook) == address(0)) revert HookNotSet();
+        hook.validateSniperConfig(config);
         sniperConfig = config;
         emit SniperConfigUpdated(config);
     }
@@ -215,10 +220,11 @@ contract TokenFactory is Ownable, IUnlockCallback {
     ///         MAX_OWNER_BUY_BPS (10%) of the supply; ETH it did not need is refunded.
     /// @return token The new token.
     /// @return poolId The id of its v4 pool.
-    function createERC20(ERC20Params calldata p) external payable returns (address token, PoolId poolId) {
+    function createERC20(ERC20Params calldata p) external payable nonReentrant returns (address token, PoolId poolId) {
         EthFeeHook _hook = hook;
         if (address(_hook) == address(0)) revert HookNotSet();
-        if (p.totalSupply == 0 || p.totalSupply > type(uint128).max) revert InvalidSupply();
+        // v4 balance deltas are int128, so the whole supply must fit in one (~1.7e38 wei = 1.7e20 tokens).
+        if (p.totalSupply == 0 || p.totalSupply > uint128(type(int128).max)) revert InvalidSupply();
         int24 startTick = startTickFor(p.totalSupply, p.marketCapEth);
 
         token = Clones.cloneDeterministic(erc20Implementation, _salt(msg.sender, p.salt));
@@ -236,22 +242,27 @@ contract TokenFactory is Ownable, IUnlockCallback {
 
         _hook.registerPool(key, msg.sender, p.feeBps, protocolShareBps, sniperConfig);
         poolManager.initialize(key, TickMath.getSqrtPriceAtTick(startTick));
-        _seedPoolAndBuy(key, startTick, p.totalSupply);
+        uint256 ethSpent = _seedPoolAndBuy(key, startTick, p.totalSupply);
 
         isFactoryToken[token] = true;
         tokenType[token] = TokenType.ERC20;
         _poolKeys[token] = key;
         emit ERC20Created(token, msg.sender, poolId, p.totalSupply, p.feeBps, p.marketCapEth, startTick);
+
+        // Interaction last: the launch buy stops at the 10% cap, so ETH beyond what that costs is returned.
+        if (msg.value > ethSpent) Address.sendValue(payable(msg.sender), msg.value - ethSpent);
     }
 
     /// @dev Adds the whole supply as one-sided liquidity and runs the creator's launch buy with `msg.value`.
-    function _seedPoolAndBuy(PoolKey memory key, int24 startTick, uint256 totalSupply) internal {
+    /// @return ethSpent ETH the launch buy used; the caller refunds the rest of `msg.value`.
+    function _seedPoolAndBuy(PoolKey memory key, int24 startTick, uint256 totalSupply)
+        internal
+        returns (uint256 ethSpent)
+    {
         // One-sided position holding only the token: [minTick, startTick] lies entirely at/below the current tick.
         // Buying (ETH -> token) moves the price down through the range.
         int24 minTick = TickMath.minUsableTick(TICK_SPACING);
-        uint128 liquidity = LiquidityAmounts.getLiquidityForAmount1(
-            TickMath.getSqrtPriceAtTick(minTick), TickMath.getSqrtPriceAtTick(startTick), totalSupply
-        );
+        uint128 liquidity = liquidityFor(totalSupply, startTick);
         LaunchData memory data = LaunchData({
             key: key,
             tickLower: minTick,
@@ -261,10 +272,9 @@ contract TokenFactory is Ownable, IUnlockCallback {
             buyAmount: msg.value,
             buyer: msg.sender
         });
-        (uint256 ethSpent, uint256 tokensBought) =
+        uint256 tokensBought;
+        (ethSpent, tokensBought) =
             abi.decode(poolManager.unlock(abi.encode(Action.Launch, abi.encode(data))), (uint256, uint256));
-        // The launch buy stops at the 10% cap, so ETH beyond what that costs is returned.
-        if (msg.value > ethSpent) Address.sendValue(payable(msg.sender), msg.value - ethSpent);
         if (tokensBought > 0) emit OwnerBuy(Currency.unwrap(key.currency1), msg.sender, ethSpent, tokensBought);
 
         // Rounding leaves a few wei of the token unplaced; burn them so the whole supply is in the pool.
@@ -335,8 +345,12 @@ contract TokenFactory is Ownable, IUnlockCallback {
         if (d.buyAmount == 0) return abi.encode(uint256(0), uint256(0));
 
         uint256 cap = d.totalSupply * MAX_OWNER_BUY_BPS / 10_000;
-        uint160 sqrtLimit =
-            uint160(TickMath.getSqrtPriceAtTick(d.tickUpper) - FullMath.mulDiv(cap, FixedPoint96.Q96, d.liquidity));
+        // step = cap * 2^96 / L ~= 10% of (sqrtStart - sqrtMin). It rounds to 0 only for dust supplies (cap of 0
+        // tokens when the supply is under 10 wei, or a cap below one sqrtPrice unit). Then no buy fits under the cap:
+        // skip it (the caller refunds everything) rather than hand v4 a price limit equal to the current price.
+        uint256 step = FullMath.mulDiv(cap, FixedPoint96.Q96, d.liquidity);
+        if (step == 0) return abi.encode(uint256(0), uint256(0));
+        uint160 sqrtLimit = uint160(TickMath.getSqrtPriceAtTick(d.tickUpper) - step);
         BalanceDelta swapDelta = poolManager.swap(
             d.key,
             SwapParams({zeroForOne: true, amountSpecified: -int256(d.buyAmount), sqrtPriceLimitX96: sqrtLimit}),
@@ -359,9 +373,14 @@ contract TokenFactory is Ownable, IUnlockCallback {
     ///         sqrtPriceX96 = sqrt(totalSupply / marketCapEth) * 2^96, rounded to the nearest multiple of TICK_SPACING.
     function startTickFor(uint256 totalSupply, uint256 marketCapEth) public pure returns (int24 tick) {
         if (marketCapEth == 0) revert InvalidMarketCap();
-        // ratio in Q128.128; its square root is Q64.64, shifted to Q64.96. Fits: totalSupply < 2^128.
-        uint256 ratioX128 = FullMath.mulDiv(totalSupply, 1 << 128, marketCapEth);
-        uint256 sqrtPriceX96 = Math.sqrt(ratioX128) << 32;
+        // sqrtPriceX96 = sqrt(ratio * 2^192), ratio = totalSupply / marketCapEth.
+        // - ratio < 2^64: ratio * 2^192 fits in 256 bits, so take its square root directly (full precision, also
+        //   for tiny ratios where a lower-precision intermediate would round to nothing).
+        // - otherwise: sqrt(ratio * 2^128) * 2^32. The intermediate is >= 2^192, so precision is not an issue.
+        //   Fits: totalSupply < 2^128.
+        uint256 sqrtPriceX96 = totalSupply / marketCapEth < (1 << 64)
+            ? Math.sqrt(FullMath.mulDiv(totalSupply, 1 << 192, marketCapEth))
+            : Math.sqrt(FullMath.mulDiv(totalSupply, 1 << 128, marketCapEth)) << 32;
         if (sqrtPriceX96 < TickMath.MIN_SQRT_PRICE || sqrtPriceX96 >= TickMath.MAX_SQRT_PRICE) {
             revert InvalidMarketCap();
         }
@@ -373,6 +392,22 @@ contract TokenFactory is Ownable, IUnlockCallback {
         if (tick <= TickMath.minUsableTick(TICK_SPACING) || tick > TickMath.maxUsableTick(TICK_SPACING)) {
             revert InvalidMarketCap();
         }
+    }
+
+    /// @notice Liquidity of the launch position that holds `totalSupply` tokens over [minUsableTick, startTick].
+    ///         L = totalSupply * 2^96 / (sqrtStart - sqrtMin), i.e. roughly sqrt(totalSupply * marketCap).
+    /// @dev    Reverts with SupplyTooLargeForPrice above the v4 per-tick liquidity limit (~1.1e34 for tick spacing
+    ///         60), which v4 would otherwise reject deep inside modifyLiquidity. Only reachable with absurd inputs
+    ///         (supply x market cap above ~1e68 in wei units).
+    function liquidityFor(uint256 totalSupply, int24 startTick) public pure returns (uint128) {
+        uint256 liquidity = FullMath.mulDiv(
+            totalSupply,
+            FixedPoint96.Q96,
+            TickMath.getSqrtPriceAtTick(startTick) - TickMath.getSqrtPriceAtTick(TickMath.minUsableTick(TICK_SPACING))
+        );
+        if (liquidity == 0) revert InvalidSupply(); // dust supply: nothing to place
+        if (liquidity > Pool.tickSpacingToMaxLiquidityPerTick(TICK_SPACING)) revert SupplyTooLargeForPrice();
+        return uint128(liquidity);
     }
 
     /// @notice The v4 pool key of an ERC20 launched by this factory.

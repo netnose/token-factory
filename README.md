@@ -70,7 +70,7 @@ With a 5% creator fee, the total fee over time is:
 **Owner controls:** `lowerFee` lowers the fee and can never raise it. `transferPoolOwnership` sends future fees to a new address.
 
 **Payout:** each fee is split between the creator and the platform at swap time, as ERC-6909 ETH claims on the PoolManager.
-- **Creator's part:** held by the hook. It's paid out with `claim()`, or anyone can call `claimFor(addr)` on the creator's behalf.
+- **Creator's part:** held by the hook. It's paid out with `claim()`, or with `claimTo(to)` to send it to another address (useful for an owner contract that can't receive ETH). Anyone can call `claimFor(owner)` to push the owner's balance to the owner.
 - **Platform's part:** credited **straight to the factory** during the swap.
 - No ETH moves during a swap, so a recipient that rejects ETH can never block trading.
 - ETH can't be sent directly mid-swap, because the PoolManager may not hold it yet.
@@ -135,9 +135,49 @@ FACTORY=<factory> NAME="My Token" SYMBOL=MYT FEE_BPS=300 MARKET_CAP=100000000000
 
 The deploy script mines the hook salt against the standard CREATE2 deployer, deploys the factory and the hook, then wires them together with `setHook`.
 
+## Testing and security
+
+```bash
+forge test                      # unit + fuzz + invariant tests
+FOUNDRY_PROFILE=ci forge test   # what CI runs: 10k fuzz runs, 256 x 128 invariant runs
+```
+
+GitHub Actions runs format check, build and the CI profile on every push and pull request (`.github/workflows/test.yml`).
+
+**Invariant tests** (`test/invariant/`) run random sequences of launches (with random owner buys), all four swap kinds, time jumps across the sniper window, claims, platform withdrawals, fee cuts and ownership transfers. After each call the handler checks that the charged fee matches the formula exactly. After each sequence, the suite checks that:
+
+- **Fees:**
+  - every fee wei is accounted for: charged = held by owners + held by the platform + paid out;
+  - the hook's ETH claims exactly equal what it owes pool owners;
+  - the PoolManager holds the ETH behind every claim;
+  - a pool's fee never rises above its launch value, and the total fee never exceeds 90%.
+- **Tokens:**
+  - supply is fixed and every token is accounted for;
+  - the locked liquidity never moves;
+  - the owner buy never exceeds 10% of the supply and never pays a fee.
+- **NFTs:**
+  - every wei paid for a mint is either in the collection, withdrawn by the owner, or the platform's exact share;
+  - supply caps hold, and balances match minted counts.
+
+**Hardening fixes from the review**
+- `claimTo`: an owner that can't receive ETH can still get its fees out.
+- `createERC20` and `withdraw` use a reentrancy lock (transient storage), and `createERC20` sends its refund last.
+- NFT mints reserve supply before sending ETH anywhere.
+- `setSniperConfig` always validates, so it needs the hook to be set first.
+- `startTickFor` keeps full precision at extreme prices.
+- Launch inputs Uniswap can't handle now revert with the factory's own errors instead of an overflow deep inside Uniswap:
+  - `InvalidSupply`: the supply is above `int128.max`, or so small it rounds to no liquidity.
+  - `SupplyTooLargeForPrice`: the liquidity would exceed the per-tick limit.
+  - `InvalidMarketCap`: the market cap is outside Uniswap's price range.
+- The owner buy is skipped (and the ETH refunded) when the supply is so tiny that 10% of it rounds to nothing.
+- A fuzz test checks that `createERC20` fails only with those errors, whatever the supply, market cap and owner buy.
+
 ## Known trade-offs
 
-- On an exact-in buy with a `sqrtPriceLimit` that stops the swap early, the fee is still charged on the full amount specified. Normal routers don't set a limit like that.
+- **Fee on partial fills:** when ETH is the amount the user fixes (buying with exactly X ETH, or selling for exactly X ETH), the fee is charged on X before the swap runs. If the swap then fills only partly, the fee still covers all of X. That happens when a price limit stops the swap early, or when a sell asks for more ETH than the pool holds. Normal routers don't set limits like that.
+- **Empty price region:** above the launch price the pool has no liquidity. A sell there moves the price for free and fills nothing, which is standard Uniswap v4 behavior. The next buy moves back through the empty region at no cost, so buyers aren't harmed.
+- **Fee avoidance:** anyone can create a separate pool for the same token without our hook and trade there fee-free. Every fee-by-hook design has this weakness; only a transfer tax built into the token is enforced everywhere.
+- **NFT limits:** per-wallet mint limits can be dodged by using several wallets. The default royalty receiver is set at creation and doesn't follow ownership transfers.
 - The sniper fee is based on timestamps. On Base (2 s blocks), the window is about 7–8 blocks.
 - The creator's launch buy pays no fees and can take up to 10% of the supply. Buyers can see how much the creator bought through the `OwnerBuy` event.
 - None of this has been audited. Get a review before deploying to mainnet.

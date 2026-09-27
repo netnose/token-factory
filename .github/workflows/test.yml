@@ -1,0 +1,32 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  FOUNDRY_PROFILE: ci
+
+jobs:
+  test:
+    name: Foundry
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Check formatting
+        run: forge fmt --check
+
+      - name: Build
+        run: forge build --sizes
+
+      - name: Test (unit, fuzz, invariant)
+        run: forge test -vvv

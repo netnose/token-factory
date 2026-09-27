@@ -78,27 +78,34 @@ contract FactoryERC721 is ERC721Upgradeable, MintRevenue {
         uint256 minted = publicMinted[msg.sender] + quantity;
         if (maxPerWallet != 0 && minted > maxPerWallet) revert ExceedsWalletLimit();
         publicMinted[msg.sender] = minted;
+        firstTokenId = _reserve(quantity);
         _collect(price * quantity);
-        return _mintMany(msg.sender, quantity);
+        _mintIds(msg.sender, firstTokenId, quantity);
     }
 
     /// @notice Owner mint of the next token id to `to`.
     function mint(address to) external onlyOwner returns (uint256 tokenId) {
-        return _mintMany(to, 1);
+        tokenId = _reserve(1);
+        _mintIds(to, tokenId, 1);
     }
 
     /// @notice Owner mint of `quantity` consecutive token ids to `to`. Returns the first id.
     function mintBatch(address to, uint256 quantity) external onlyOwner returns (uint256 firstTokenId) {
         if (quantity == 0) revert ZeroQuantity();
-        return _mintMany(to, quantity);
+        firstTokenId = _reserve(quantity);
+        _mintIds(to, firstTokenId, quantity);
     }
 
-    /// @dev Reserves the ids before minting, so re-entering through onERC721Received sees the updated supply.
-    function _mintMany(address to, uint256 quantity) internal returns (uint256 firstTokenId) {
+    /// @dev Books `quantity` ids against the supply cap before any external call (payment forwarding, the
+    ///      onERC721Received callback), so re-entering sees the updated supply. Returns the first reserved id.
+    function _reserve(uint256 quantity) internal returns (uint256 firstTokenId) {
         firstTokenId = totalMinted + 1;
         uint256 newTotal = totalMinted + quantity;
         if (maxSupply != 0 && newTotal > maxSupply) revert ExceedsMaxSupply();
         totalMinted = newTotal;
+    }
+
+    function _mintIds(address to, uint256 firstTokenId, uint256 quantity) internal {
         for (uint256 i; i < quantity; ++i) {
             _safeMint(to, firstTokenId + i);
         }

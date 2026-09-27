@@ -25,6 +25,32 @@ contract RejectsEth {
     receive() external payable {
         revert("no eth");
     }
+
+    function call(address target, bytes calldata data) external returns (bytes memory) {
+        (bool ok, bytes memory ret) = target.call(data);
+        require(ok, "call failed");
+        return ret;
+    }
+}
+
+/// @dev Re-enters createERC20 from the refund.
+contract ReentrantCreator {
+    TokenFactory factory;
+    TokenFactory.ERC20Params params;
+
+    constructor(TokenFactory _factory) {
+        factory = _factory;
+    }
+
+    function launch(TokenFactory.ERC20Params calldata p) external payable {
+        params = p;
+        factory.createERC20{value: msg.value}(p);
+    }
+
+    receive() external payable {
+        params.salt = bytes32(uint256(params.salt) + 1);
+        factory.createERC20(params);
+    }
 }
 
 abstract contract FactoryFixture is Test {
@@ -153,19 +179,28 @@ contract TokenFactoryTest is FactoryFixture {
     }
 
     function testFuzz_startTickFor_within03Percent(uint128 supply, uint128 marketCap) public view {
-        supply = uint128(bound(supply, 1e18, 1e36));
-        marketCap = uint128(bound(marketCap, 1e12, 1e27));
+        // Covers the whole input range, including prices near both ends of the v4 range. Below 1e6 wei a 0.3%
+        // tolerance is meaningless (integer granularity), so tiny amounts are excluded.
+        supply = uint128(bound(supply, 1e6, type(uint128).max));
+        marketCap = uint128(bound(marketCap, 1e6, type(uint128).max));
         int24 tick;
         try factory.startTickFor(supply, marketCap) returns (int24 t) {
             tick = t;
         } catch {
             return; // out of the usable price range
         }
-        // implied market cap = supply / price, price = (sqrtP / 2^96)^2 tokens per ETH
+        // price = (sqrtP / 2^96)^2 tokens per ETH, and marketCap * price should equal supply (within the 0.3% tick
+        // rounding). Compare on whichever side keeps full integer precision.
         uint256 sqrtP = TickMath.getSqrtPriceAtTick(tick);
-        uint256 priceX128 = FullMath.mulDiv(sqrtP, sqrtP, 1 << 64);
-        uint256 implied = FullMath.mulDiv(supply, 1 << 128, priceX128);
-        assertApproxEqRel(implied, marketCap, 0.0031e18);
+        if (sqrtP >= 1 << 96) {
+            // price >= 1: implied supply = marketCap * price
+            uint256 priceX96 = FullMath.mulDiv(sqrtP, sqrtP, 1 << 96);
+            assertApproxEqRel(FullMath.mulDiv(marketCap, priceX96, 1 << 96), supply, 0.0031e18);
+        } else {
+            // price < 1: implied market cap = supply / price
+            uint256 implied = FullMath.mulDiv(FullMath.mulDiv(supply, 1 << 96, sqrtP), 1 << 96, sqrtP);
+            assertApproxEqRel(implied, marketCap, 0.0031e18);
+        }
     }
 
     function test_startTickFor_reverts() public {
@@ -426,6 +461,23 @@ contract TokenFactoryTest is FactoryFixture {
         assertGt(hook.owed(address(bad)), 0);
     }
 
+    function test_claimTo_rescuesOwnerThatRejectsEth() public {
+        RejectsEth bad = new RejectsEth();
+        (, PoolKey memory key) = _launch(500);
+        vm.prank(creator);
+        hook.transferPoolOwnership(key.toId(), address(bad));
+        _swap(key, true, -1 ether, 1 ether);
+
+        uint256 amount = hook.owed(address(bad));
+        address rescue = makeAddr("rescue");
+        bad.call(address(hook), abi.encodeCall(EthFeeHook.claimTo, (rescue)));
+        assertEq(rescue.balance, amount);
+        assertEq(hook.owed(address(bad)), 0);
+
+        vm.expectRevert(EthFeeHook.InvalidRecipient.selector);
+        hook.claimTo(address(0));
+    }
+
     // ---------------------------------------------------------------------------------------------------------------
     // Fee management
     // ---------------------------------------------------------------------------------------------------------------
@@ -582,6 +634,69 @@ contract TokenFactoryTest is FactoryFixture {
         assertEq(v - creator.balance, address(manager).balance);
         assertEq(address(factory).balance, 0);
         assertEq(_totalOwed(), 0, "fee-free");
+    }
+
+    function test_ownerBuy_atLowestAllowedPrice() public {
+        // Market cap so large the start tick is the lowest one the factory accepts (one spacing above the
+        // minimum usable tick). The capped launch buy must still work.
+        // Supply small enough that the liquidity stays under the v4 per-tick limit at this price.
+        TokenFactory.ERC20Params memory p = _params(500);
+        p.totalSupply = 1e11;
+        p.marketCapEth = 33647e45; // 1e11 / 1.0001^-887160
+        int24 tick = factory.startTickFor(p.totalSupply, p.marketCapEth);
+        assertEq(tick, TickMath.minUsableTick(60) + 60, "lowest tick the factory accepts");
+        vm.prank(creator);
+        (address token,) = factory.createERC20{value: 1 ether}(p);
+        assertLe(IERC20(token).balanceOf(creator), p.totalSupply / 10);
+    }
+
+    function test_createERC20_supplyTooLargeForPrice() public {
+        // Liquidity ~ sqrt(supply * marketCap): 1e38 * 1e38 wei is far beyond the v4 per-tick limit.
+        TokenFactory.ERC20Params memory p = _params(500);
+        p.totalSupply = 1e38;
+        p.marketCapEth = 1e38;
+        vm.prank(creator);
+        vm.expectRevert(TokenFactory.SupplyTooLargeForPrice.selector);
+        factory.createERC20(p);
+    }
+
+    /// @dev Any supply / market cap / owner buy either launches correctly or fails with one of the factory's own
+    ///      validation errors - never with an arithmetic panic or a revert from deep inside Uniswap.
+    function testFuzz_createERC20_onlyExpectedReverts(uint128 supply, uint128 marketCap, uint96 value) public {
+        TokenFactory.ERC20Params memory p = _params(500);
+        p.totalSupply = bound(supply, 1, type(uint128).max);
+        p.marketCapEth = bound(marketCap, 1, type(uint128).max);
+        uint256 v = bound(value, 0, 100 ether);
+        vm.deal(creator, v);
+        vm.prank(creator);
+        try factory.createERC20{value: v}(p) returns (address token, PoolId) {
+            assertLe(IERC20(token).balanceOf(creator), p.totalSupply / 10);
+            assertEq(address(factory).balance, 0);
+        } catch (bytes memory err) {
+            bytes4 sel = bytes4(err);
+            assertTrue(
+                sel == TokenFactory.InvalidMarketCap.selector || sel == TokenFactory.SupplyTooLargeForPrice.selector
+                    || sel == TokenFactory.InvalidSupply.selector,
+                "unexpected revert"
+            );
+        }
+    }
+
+    function test_createERC20_nonReentrant() public {
+        ReentrantCreator attacker = new ReentrantCreator(factory);
+        TokenFactory.ERC20Params memory p = _params(500);
+        p.totalSupply = 1_000 ether;
+        p.marketCapEth = 1 ether; // 50 ETH overshoots the 10% cap -> refund -> re-entry
+        vm.deal(address(attacker), 0);
+        vm.expectRevert();
+        attacker.launch{value: 50 ether}(p);
+    }
+
+    function test_setSniperConfig_requiresHook() public {
+        TokenFactory fresh = new TokenFactory(manager, platform);
+        vm.prank(platform);
+        vm.expectRevert(TokenFactory.HookNotSet.selector);
+        fresh.setSniperConfig(EthFeeHook.SniperConfig(8_000, 15, 5));
     }
 
     function test_noOwnerBuyWithoutValue() public {

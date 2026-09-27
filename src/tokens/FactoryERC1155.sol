@@ -71,8 +71,8 @@ contract FactoryERC1155 is ERC1155Upgradeable, MintRevenue {
         uint256 minted = publicMinted[id][msg.sender] + quantity;
         if (sale.maxPerWallet != 0 && minted > sale.maxPerWallet) revert ExceedsWalletLimit();
         publicMinted[id][msg.sender] = minted;
-        _collect(sale.price * quantity);
         _reserve(id, quantity);
+        _collect(sale.price * quantity);
         _mint(msg.sender, id, quantity, "");
     }
 
