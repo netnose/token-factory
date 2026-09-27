@@ -17,6 +17,8 @@ import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
 import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
+import {PoolModifyLiquidityTest} from "@uniswap/v4-core/src/test/PoolModifyLiquidityTest.sol";
+import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 
 import {TokenFactory} from "../src/TokenFactory.sol";
 import {EthFeeHook} from "../src/EthFeeHook.sol";
@@ -57,7 +59,7 @@ abstract contract FactoryFixture is Test {
     using StateLibrary for IPoolManager;
 
     uint160 constant HOOK_FLAGS = uint160(
-        Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+        Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
             | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
     );
     uint16 constant PROTOCOL_SHARE = 1_000; // 10% of the creator fee
@@ -779,6 +781,44 @@ contract TokenFactoryTest is FactoryFixture {
         hook.beforeSwap(address(this), key, SwapParams(true, -1 ether, 0), "");
         vm.expectRevert(EthFeeHook.NotPoolManager.selector);
         hook.unlockCallback(abi.encode(address(this), 1 ether));
+    }
+
+    /// @dev Outsiders cannot add liquidity to launch pools, in any range: ETH-only above the price, token-only below
+    ///      it, or both around it. The pool keeps exactly one position, the locked launch liquidity.
+    function test_addLiquidity_closedToOutsiders() public {
+        (address token, PoolKey memory key) = _launch(500);
+        _swap(key, true, -5 ether, 5 ether); // trader holds tokens; the price is now inside the locked range
+
+        PoolModifyLiquidityTest lpRouter = new PoolModifyLiquidityTest(manager);
+        vm.prank(trader);
+        IERC20(token).approve(address(lpRouter), type(uint256).max);
+        (, int24 tick,,) = IPoolManager(address(manager)).getSlot0(key.toId());
+        int24 t = tick / 60 * 60;
+        int24[2][3] memory ranges = [[t + 600, t + 6_000], [t - 6_000, t - 600], [t - 3_000, t + 3_000]];
+
+        for (uint256 i; i < ranges.length; ++i) {
+            vm.prank(trader);
+            vm.expectRevert(); // AddLiquidityDisabled, wrapped by the PoolManager
+            lpRouter.modifyLiquidity{value: 10 ether}(
+                key, ModifyLiquidityParams(ranges[i][0], ranges[i][1], 1e18, bytes32(0)), ""
+            );
+        }
+        (uint128 outside,,) =
+            IPoolManager(address(manager)).getPositionInfo(key.toId(), address(lpRouter), t - 3_000, t + 3_000, 0);
+        assertEq(outside, 0);
+    }
+
+    function test_beforeAddLiquidity_onlyPoolManagerAndFactory() public {
+        (, PoolKey memory key) = _launch(500);
+        ModifyLiquidityParams memory p = ModifyLiquidityParams(-600, 600, 1e18, bytes32(0));
+        vm.expectRevert(EthFeeHook.NotPoolManager.selector);
+        hook.beforeAddLiquidity(address(factory), key, p, "");
+
+        vm.startPrank(address(manager));
+        vm.expectRevert(EthFeeHook.AddLiquidityDisabled.selector);
+        hook.beforeAddLiquidity(trader, key, p, "");
+        assertEq(hook.beforeAddLiquidity(address(factory), key, p, ""), IHooks.beforeAddLiquidity.selector);
+        vm.stopPrank();
     }
 
     function test_registerPool_onlyFactory() public {

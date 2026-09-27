@@ -45,8 +45,8 @@ import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/Pool
 ///   Hooks & permissions  A pool names a hook contract in its PoolKey. The PoolManager calls the hook around pool
 ///                        actions, but only the ones enabled by flag bits in the low 14 bits of the hook's ADDRESS.
 ///                        This contract must be deployed (via a mined CREATE2 salt) at an address whose bits enable
-///                        exactly: beforeInitialize, beforeSwap, afterSwap, beforeSwapReturnDelta and
-///                        afterSwapReturnDelta. The constructor checks it.
+///                        exactly: beforeInitialize, beforeAddLiquidity, beforeSwap, afterSwap,
+///                        beforeSwapReturnDelta and afterSwapReturnDelta. The constructor checks it.
 ///
 ///   Currencies           ETH is represented as address(0). Pools sort their two currencies, so ETH is always
 ///                        currency0 and the token is always currency1.
@@ -107,7 +107,11 @@ import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/Pool
 /// ====================================================================================================================
 ///
 ///   - Only the factory can create pools with this hook (`beforeInitialize`), and it registers each pool's config
-///     first. The config is fixed at launch: the platform cannot change an existing pool's fee, protocol share or
+///     first.
+///   - Only the factory can add liquidity (`beforeAddLiquidity`): each pool holds exactly one position, the launch
+///     liquidity locked forever, so its price curve is fully determined by the supply and starting market cap.
+///     Outsiders could not earn anything here anyway (the pool's LP fee is 0 and the fee goes through this hook),
+///     so allowing them in would only let people lose money to arbitrage for nothing. The config is fixed at launch: the platform cannot change an existing pool's fee, protocol share or
 ///     sniper settings. Only the pool owner can change anything, and only by lowering the creator fee or handing
 ///     ownership to another address.
 ///   - There is no admin, no upgradeability and no way to move owners' funds except to the owner.
@@ -189,6 +193,8 @@ contract EthFeeHook is IHooks, IUnlockCallback {
     error InvalidRecipient();
     error NothingToClaim();
     error HookNotImplemented();
+    /// @notice Only the factory can add liquidity to launch pools.
+    error AddLiquidityDisabled();
     /// @notice A swap with a fixed ETH amount did not fill completely (see `_requireFullFill`).
     error PartialFill(uint256 expectedEth, uint256 actualEth);
 
@@ -207,13 +213,14 @@ contract EthFeeHook is IHooks, IUnlockCallback {
 
     /// @notice The callbacks this hook uses. Must match the flag bits of the deployment address.
     ///         - beforeInitialize:       only the factory may create pools with this hook.
+    ///         - beforeAddLiquidity:     only the factory may add liquidity (the locked launch position).
     ///         - beforeSwap / afterSwap: charge the fee (on the specified / unspecified ETH leg respectively).
     ///         - *ReturnDelta:           allow those two callbacks to take a cut of the swap by returning a delta.
     function getHookPermissions() public pure returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
             beforeInitialize: true,
             afterInitialize: false,
-            beforeAddLiquidity: false,
+            beforeAddLiquidity: true,
             afterAddLiquidity: false,
             beforeRemoveLiquidity: false,
             afterRemoveLiquidity: false,
@@ -404,6 +411,19 @@ contract EthFeeHook is IHooks, IUnlockCallback {
         return IHooks.beforeInitialize.selector;
     }
 
+    /// @dev Liquidity gate: only the factory may add liquidity, which it does once, for the locked launch position.
+    ///      `sender` is whoever called `poolManager.modifyLiquidity`. Removing liquidity is not gated: the only
+    ///      position in these pools is the factory's, and the factory has no function to remove it.
+    function beforeAddLiquidity(address sender, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
+        external
+        view
+        onlyPoolManager
+        returns (bytes4)
+    {
+        if (sender != factory) revert AddLiquidityDisabled();
+        return IHooks.beforeAddLiquidity.selector;
+    }
+
     /// @dev Charges the fee when ETH is the SPECIFIED leg (exact-in buy, exact-out sell), before the swap runs.
     ///      Returning (+fee) as the specified delta makes the PoolManager adjust the swap by `fee`:
     ///        exact-in buy  (amountSpecified = -X): the pool swaps only X - fee; the user still pays X.
@@ -510,14 +530,6 @@ contract EthFeeHook is IHooks, IUnlockCallback {
     // in this contract's address; they revert in case anything else does.
 
     function afterInitialize(address, PoolKey calldata, uint160, int24) external pure returns (bytes4) {
-        revert HookNotImplemented();
-    }
-
-    function beforeAddLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
-        external
-        pure
-        returns (bytes4)
-    {
         revert HookNotImplemented();
     }
 

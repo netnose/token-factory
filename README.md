@@ -29,6 +29,7 @@ A factory for ERC20, ERC721 and ERC1155 tokens on Uniswap v4. It targets Base Se
    - The tokens go to the caller, and the buy emits an `OwnerBuy` event.
    - The buy is **capped at 10% of the supply**. The swap is given a price limit at exactly the point where 10% has been bought, so it stops there on its own. Any ETH it didn't need is refunded.
 6. The factory owns the position and has no function to remove it, so the **liquidity is locked forever**.
+7. **Nobody else can add liquidity.** The hook lets only the factory add liquidity, so each pool holds exactly one position: the locked launch liquidity. The price for any trade size therefore follows exactly from the supply and starting market cap. It also protects users: the pool's LP fee is 0, so an outsider who added liquidity would earn nothing while arbitrage trades against them as the price moves.
 
 ## Swap fees (always in ETH)
 
@@ -110,7 +111,7 @@ There is no creation fee.
 
 ### Why there is one shared hook
 
-A v4 hook's permissions live in the low 14 bits of its address, so every hook needs a mined CREATE2 salt. A separate hook per token would mean mining a salt for every launch. Instead, the protocol deploys one `EthFeeHook` and it keeps a separate fee config for each pool. Only the factory can create pools with it (`beforeInitialize`).
+A v4 hook's permissions live in the low 14 bits of its address, so every hook needs a mined CREATE2 salt. A separate hook per token would mean mining a salt for every launch. Instead, the protocol deploys one `EthFeeHook` and it keeps a separate fee config for each pool. Only the factory can create pools with it (`beforeInitialize`) or add liquidity to them (`beforeAddLiquidity`).
 
 The source of `src/EthFeeHook.sol` explains the hook in detail: the Uniswap v4 concepts it relies on, where each fee is taken and why, the sniper curve, and how the ETH is accounted for.
 
