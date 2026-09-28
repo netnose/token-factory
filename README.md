@@ -6,9 +6,9 @@ A factory for ERC20, ERC721 and ERC1155 tokens on Uniswap v4. It targets Base Se
 | --- | --- |
 | `src/TokenFactory.sol` | Deploys all three token types as cheap EIP-1167 clones with deterministic addresses. Launches each ERC20 into its own v4 pool. Holds the platform config. |
 | `src/EthFeeHook.sol` | Uniswap v4 hook that charges the creator fee (0–5%) plus a decaying sniper fee, always in ETH. |
-| `src/tokens/FactoryERC20.sol` | Fixed-supply ERC20 with EIP-2612 permit. No owner and no minting after launch. |
-| `src/tokens/FactoryERC721.sol` | ERC721 collection: free owner mint, a paid public mint, and ERC-2981 royalties. |
-| `src/tokens/FactoryERC1155.sol` | ERC1155 collection: free owner mint, a paid public mint and a metadata URI per token id, and ERC-2981 royalties. |
+| `src/tokens/FactoryERC20.sol` | Fixed-supply ERC20 with EIP-2612 permit and EIP-7572 `contractURI`. No owner and no minting after launch. |
+| `src/tokens/FactoryERC721.sol` | ERC721 collection: free owner mint, a paid public mint, ERC-2981 royalties, EIP-4906 and EIP-7572. |
+| `src/tokens/FactoryERC1155.sol` | ERC1155 collection: free owner mint, a paid public mint, a metadata URI per token id, ERC-2981 royalties, EIP-4906 events and EIP-7572. |
 | `src/tokens/MintRevenue.sol` | Shared NFT plumbing: sends the platform's cut of each mint to the factory, handles owner withdrawals and royalties. |
 
 ## How an ERC20 launch works
@@ -96,6 +96,16 @@ Payment must be exact. The platform's share of mint revenue is fixed when the co
 
 **ERC1155 metadata:** `setTokenURI(id, uri)` gives a token id its own URI. Ids without one use the collection's base URI (`setURI`, which may include `{id}`). Setting an empty string reverts the id to the base URI.
 
+## Metadata standards
+
+**EIP-7572, contract-level metadata:** all three token types have `contractURI()`, which returns a JSON document with the name, description, image, banner and links that marketplaces and wallets show on collection and token pages. It emits `ContractURIUpdated()` when set.
+- **NFT collections:** set at creation (`contractURI` in the creation parameters). The owner can change it with `setContractURI`.
+- **ERC20s:** set at creation and **permanent**, because the token has no owner. If the metadata needs to change later, point it at mutable storage such as IPNS.
+
+**EIP-4906, metadata refresh events:** these tell marketplaces to re-fetch token metadata.
+- **ERC721:** fully supported. `supportsInterface(0x49064906)` returns true, and `setBaseURI` emits `BatchMetadataUpdate(0, type(uint256).max)`, which refreshes every token.
+- **ERC1155:** emits the same events alongside the standard `URI` event: `BatchMetadataUpdate` from `setURI`, and `MetadataUpdate(id)` from `setTokenURI`. EIP-4906 is defined for ERC721, so the ERC1155 doesn't claim its interface ID, but marketplaces watch these events on ERC1155 contracts too.
+
 **Royalties (ERC-2981):** both collection types support royalties, capped at 10%.
 - The royalty is set at creation. If no receiver is given, it defaults to the creator.
 - The owner can change it with `setDefaultRoyalty(receiver, bps)`, or override it for a single token id with `setTokenRoyalty(id, receiver, bps)`.
@@ -132,7 +142,7 @@ cp .env.example .env && source .env
 forge script script/Deploy.s.sol --rpc-url base_sepolia --account <keystore> --broadcast --verify
 
 # launch a token
-FACTORY=<factory> NAME="My Token" SYMBOL=MYT FEE_BPS=300 MARKET_CAP=10000000000000000000 OWNER_BUY=100000000000000000 \
+FACTORY=<factory> NAME="My Token" SYMBOL=MYT FEE_BPS=300 MARKET_CAP=10000000000000000000 OWNER_BUY=100000000000000000 CONTRACT_URI=ipfs://... \
   forge script script/CreateToken.s.sol --rpc-url base_sepolia --account <keystore> --broadcast
 ```
 

@@ -12,6 +12,7 @@ import {TokenFactory} from "../src/TokenFactory.sol";
 import {FactoryERC721} from "../src/tokens/FactoryERC721.sol";
 import {FactoryERC1155} from "../src/tokens/FactoryERC1155.sol";
 import {MintRevenue} from "../src/tokens/MintRevenue.sol";
+import {IERC7572} from "../src/interfaces/IERC7572.sol";
 import {FactoryFixture} from "./TokenFactory.t.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 
@@ -53,6 +54,7 @@ contract NFTTest is FactoryFixture, ERC1155Holder {
                     name: "Col",
                     symbol: "COL",
                     baseURI: "ipfs://base/",
+                    contractURI: "ipfs://collection.json",
                     sale: FactoryERC721.SaleConfig({price: 0.1 ether, maxSupply: 10, maxPerWallet: 3, active: true}),
                     royalty: FactoryERC721.RoyaltyConfig({receiver: address(0), bps: 500}),
                     salt: bytes32(0)
@@ -68,6 +70,7 @@ contract NFTTest is FactoryFixture, ERC1155Holder {
             name: "Items",
             symbol: "ITM",
             uri: "ipfs://items/{id}.json",
+            contractURI: "ipfs://items-collection.json",
             royalty: FactoryERC721.RoyaltyConfig({receiver: treasury, bps: 250}),
             salt: salt
         });
@@ -202,7 +205,16 @@ contract NFTTest is FactoryFixture, ERC1155Holder {
         nft.mint(trader);
         vm.expectRevert();
         nft.initialize(
-            "x", "x", "x", trader, 0, FactoryERC721.SaleConfig(0, 0, 0, false), FactoryERC721.RoyaltyConfig(trader, 0)
+            FactoryERC721.InitParams(
+                "x",
+                "x",
+                "x",
+                "x",
+                trader,
+                0,
+                FactoryERC721.SaleConfig(0, 0, 0, false),
+                FactoryERC721.RoyaltyConfig(trader, 0)
+            )
         );
     }
 
@@ -411,9 +423,83 @@ contract NFTTest is FactoryFixture, ERC1155Holder {
         assertEq(manager.balanceOf(address(factory), 0), 0);
     }
 
+    // ---------------------------------------------------------------------------------------------------------------
+    // EIP-4906 (metadata update events) and EIP-7572 (contractURI)
+    // ---------------------------------------------------------------------------------------------------------------
+
+    event MetadataUpdate(uint256 _tokenId);
+    event BatchMetadataUpdate(uint256 _fromTokenId, uint256 _toTokenId);
+    event ContractURIUpdated();
+
+    function test_erc721_eip4906() public {
+        assertTrue(nft.supportsInterface(bytes4(0x49064906)), "claims EIP-4906");
+        vm.expectEmit(address(nft));
+        emit BatchMetadataUpdate(0, type(uint256).max);
+        vm.prank(creator);
+        nft.setBaseURI("ipfs://v2/");
+        vm.prank(creator);
+        nft.mint(trader);
+        assertEq(nft.tokenURI(1), "ipfs://v2/1");
+    }
+
+    function test_erc1155_eip4906Events() public {
+        assertFalse(items.supportsInterface(bytes4(0x49064906)), "EIP-4906 id is ERC-721 only");
+        vm.expectEmit(address(items));
+        emit BatchMetadataUpdate(0, type(uint256).max);
+        vm.prank(creator);
+        items.setURI("ipfs://v2/{id}.json");
+
+        vm.expectEmit(address(items));
+        emit MetadataUpdate(7);
+        vm.prank(creator);
+        items.setTokenURI(7, "ipfs://special/7.json");
+    }
+
+    function test_eip7572_contractURI_nfts() public {
+        assertEq(nft.contractURI(), "ipfs://collection.json");
+        assertEq(items.contractURI(), "ipfs://items-collection.json");
+
+        vm.expectEmit(address(nft));
+        emit ContractURIUpdated();
+        vm.prank(creator);
+        nft.setContractURI("ipfs://collection-v2.json");
+        assertEq(nft.contractURI(), "ipfs://collection-v2.json");
+
+        vm.expectEmit(address(items));
+        emit ContractURIUpdated();
+        vm.prank(creator);
+        items.setContractURI("ipfs://items-v2.json");
+        assertEq(items.contractURI(), "ipfs://items-v2.json");
+
+        vm.prank(trader);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, trader));
+        nft.setContractURI("x");
+        vm.prank(trader);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, trader));
+        items.setContractURI("x");
+    }
+
+    function test_eip7572_emittedAtCreation() public {
+        TokenFactory.ERC1155Params memory p = _erc1155Params(bytes32(uint256(42)));
+        address predicted = factory.predictAddress(TokenFactory.TokenType.ERC1155, creator, p.salt);
+        vm.expectEmit(predicted);
+        emit ContractURIUpdated();
+        vm.prank(creator);
+        factory.createERC1155(p);
+    }
+
+    function test_eip7572_contractURI_erc20IsPermanent() public {
+        (address token,) = _launch(500);
+        assertEq(IERC7572(token).contractURI(), "ipfs://token-meta.json");
+        // No owner and no setter: the call below is not part of the token's ABI.
+        (bool ok,) = token.call(abi.encodeWithSignature("setContractURI(string)", "x"));
+        assertFalse(ok);
+        assertEq(IERC7572(token).contractURI(), "ipfs://token-meta.json");
+    }
+
     function test_implementationsCannotBeInitialized() public {
         FactoryERC1155 impl = FactoryERC1155(factory.erc1155Implementation());
         vm.expectRevert();
-        impl.initialize("x", "x", "x", trader, 0, address(0), 0);
+        impl.initialize(FactoryERC1155.InitParams("x", "x", "x", "x", trader, 0, address(0), 0));
     }
 }

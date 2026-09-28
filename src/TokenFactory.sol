@@ -76,6 +76,8 @@ contract TokenFactory is Ownable, ReentrancyGuardTransient, IUnlockCallback {
         /// Starting fully-diluted market cap in wei of ETH (e.g. 10 ether). The starting price is
         /// marketCap / totalSupply ETH per token, rounded to the nearest usable tick (within 0.3%).
         uint256 marketCapEth;
+        /// EIP-7572 token metadata URI (JSON: description, image, links...). Permanent: the token has no owner.
+        string contractURI;
         /// Salt for the token's deterministic address (combined with msg.sender).
         bytes32 salt;
     }
@@ -84,6 +86,8 @@ contract TokenFactory is Ownable, ReentrancyGuardTransient, IUnlockCallback {
         string name;
         string symbol;
         string baseURI;
+        /// EIP-7572 collection metadata URI; the owner can change it later.
+        string contractURI;
         FactoryERC721.SaleConfig sale;
         FactoryERC721.RoyaltyConfig royalty;
         bytes32 salt;
@@ -94,6 +98,8 @@ contract TokenFactory is Ownable, ReentrancyGuardTransient, IUnlockCallback {
         string symbol;
         /// Base URI for every id without its own URI (may contain the `{id}` placeholder).
         string uri;
+        /// EIP-7572 collection metadata URI; the owner can change it later.
+        string contractURI;
         /// Collection-wide royalty; receiver defaults to the creator. bps max 1000, 0 = none.
         FactoryERC721.RoyaltyConfig royalty;
         bytes32 salt;
@@ -228,7 +234,7 @@ contract TokenFactory is Ownable, ReentrancyGuardTransient, IUnlockCallback {
         int24 startTick = startTickFor(p.totalSupply, p.marketCapEth);
 
         token = Clones.cloneDeterministic(erc20Implementation, _salt(msg.sender, p.salt));
-        FactoryERC20(token).initialize(p.name, p.symbol, p.totalSupply, address(this));
+        FactoryERC20(token).initialize(p.name, p.symbol, p.contractURI, p.totalSupply, address(this));
 
         // Native ETH (address 0) always sorts first, so ETH is currency0 and the token is currency1.
         PoolKey memory key = PoolKey({
@@ -286,7 +292,19 @@ contract TokenFactory is Ownable, ReentrancyGuardTransient, IUnlockCallback {
     /// @notice Creates an ERC721 collection owned by the caller, with its public sale configured.
     function createERC721(ERC721Params calldata p) external returns (address token) {
         token = Clones.cloneDeterministic(erc721Implementation, _salt(msg.sender, p.salt));
-        FactoryERC721(token).initialize(p.name, p.symbol, p.baseURI, msg.sender, protocolShareBps, p.sale, p.royalty);
+        FactoryERC721(token)
+            .initialize(
+                FactoryERC721.InitParams({
+                    name: p.name,
+                    symbol: p.symbol,
+                    baseURI: p.baseURI,
+                    contractURI: p.contractURI,
+                    owner: msg.sender,
+                    protocolShareBps: protocolShareBps,
+                    sale: p.sale,
+                    royalty: p.royalty
+                })
+            );
         isFactoryToken[token] = true;
         tokenType[token] = TokenType.ERC721;
         emit ERC721Created(token, msg.sender);
@@ -296,7 +314,18 @@ contract TokenFactory is Ownable, ReentrancyGuardTransient, IUnlockCallback {
     function createERC1155(ERC1155Params calldata p) external returns (address token) {
         token = Clones.cloneDeterministic(erc1155Implementation, _salt(msg.sender, p.salt));
         FactoryERC1155(token)
-            .initialize(p.name, p.symbol, p.uri, msg.sender, protocolShareBps, p.royalty.receiver, p.royalty.bps);
+            .initialize(
+                FactoryERC1155.InitParams({
+                    name: p.name,
+                    symbol: p.symbol,
+                    uri: p.uri,
+                    contractURI: p.contractURI,
+                    owner: msg.sender,
+                    protocolShareBps: protocolShareBps,
+                    royaltyReceiver: p.royalty.receiver,
+                    royaltyBps: p.royalty.bps
+                })
+            );
         isFactoryToken[token] = true;
         tokenType[token] = TokenType.ERC1155;
         emit ERC1155Created(token, msg.sender);
