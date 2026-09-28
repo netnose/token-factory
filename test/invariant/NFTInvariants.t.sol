@@ -132,6 +132,7 @@ contract NFTInvariantsTest is Test, ERC721Holder {
                     name: "C",
                     symbol: "C",
                     baseURI: "",
+                    contractURI: "",
                     sale: FactoryERC721.SaleConfig({price: 0.01 ether, maxSupply: 200, maxPerWallet: 20, active: true}),
                     royalty: FactoryERC721.RoyaltyConfig(address(0), 0),
                     salt: 0
@@ -141,7 +142,12 @@ contract NFTInvariantsTest is Test, ERC721Holder {
         items = FactoryERC1155(
             factory.createERC1155(
                 TokenFactory.ERC1155Params({
-                    name: "I", symbol: "I", uri: "", royalty: FactoryERC721.RoyaltyConfig(address(0), 0), salt: 0
+                    name: "I",
+                    symbol: "I",
+                    uri: "",
+                    contractURI: "",
+                    royalty: FactoryERC721.RoyaltyConfig(address(0), 0),
+                    salt: 0
                 })
             )
         );

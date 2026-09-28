@@ -13,6 +13,10 @@ import {MintRevenue} from "./MintRevenue.sol";
 ///         - Anyone can `publicMint(id, quantity)` while that id's sale is open.
 ///         - Each token id can have its own metadata URI; ids without one use the collection's base URI.
 ///         - ERC-2981 royalties (max 10%): collection-wide default, overridable per id.
+///         - EIP-4906 metadata-refresh events, alongside the standard ERC-1155 `URI` event: `BatchMetadataUpdate` when
+///           the base URI changes, `MetadataUpdate(id)` when one id's URI changes. EIP-4906 is specified for ERC-721,
+///           so its interface id is not claimed here, but marketplaces also watch these events on ERC-1155 contracts.
+///         - EIP-7572: collection-level metadata via `contractURI()`.
 ///         `name` and `symbol` are exposed for wallets and marketplaces.
 contract FactoryERC1155 is ERC1155Upgradeable, MintRevenue {
     struct Sale {
@@ -20,6 +24,18 @@ contract FactoryERC1155 is ERC1155Upgradeable, MintRevenue {
         uint64 maxSupply;
         uint64 maxPerWallet;
         bool active;
+    }
+
+    /// @dev Everything `initialize` needs, in one struct (too many separate arguments exceed the EVM stack).
+    struct InitParams {
+        string name;
+        string symbol;
+        string uri;
+        string contractURI;
+        address owner;
+        uint16 protocolShareBps;
+        address royaltyReceiver;
+        uint96 royaltyBps;
     }
 
     string public name;
@@ -33,6 +49,9 @@ contract FactoryERC1155 is ERC1155Upgradeable, MintRevenue {
 
     event SaleUpdated(uint256 indexed id, uint256 price, uint64 maxPerWallet, bool active);
     event MaxSupplyUpdated(uint256 indexed id, uint64 maxSupply);
+    /// @dev EIP-4906 events (see contract notice).
+    event MetadataUpdate(uint256 _tokenId);
+    event BatchMetadataUpdate(uint256 _fromTokenId, uint256 _toTokenId);
 
     error SaleNotActive();
     error ExceedsMaxSupply();
@@ -44,19 +63,11 @@ contract FactoryERC1155 is ERC1155Upgradeable, MintRevenue {
         _disableInitializers();
     }
 
-    function initialize(
-        string calldata name_,
-        string calldata symbol_,
-        string calldata uri_,
-        address owner_,
-        uint16 protocolShareBps_,
-        address royaltyReceiver,
-        uint96 royaltyBps
-    ) external initializer {
-        __ERC1155_init(uri_);
-        __MintRevenue_init(owner_, protocolShareBps_, royaltyReceiver, royaltyBps);
-        name = name_;
-        symbol = symbol_;
+    function initialize(InitParams calldata p) external initializer {
+        __ERC1155_init(p.uri);
+        __MintRevenue_init(p.owner, p.protocolShareBps, p.contractURI, p.royaltyReceiver, p.royaltyBps);
+        name = p.name;
+        symbol = p.symbol;
     }
 
     // ---------------------------------------------------------------------------------------------------------------
@@ -125,12 +136,14 @@ contract FactoryERC1155 is ERC1155Upgradeable, MintRevenue {
     /// @notice Sets the base URI used by every id without its own URI.
     function setURI(string calldata uri_) external onlyOwner {
         _setURI(uri_);
+        emit BatchMetadataUpdate(0, type(uint256).max);
     }
 
     /// @notice Sets token `id`'s own metadata URI. An empty string reverts it to the base URI.
     function setTokenURI(uint256 id, string calldata tokenURI) external onlyOwner {
         _tokenURIs[id] = tokenURI;
         emit URI(uri(id), id);
+        emit MetadataUpdate(id);
     }
 
     /// @notice Token `id`'s own URI if set, otherwise the collection's base URI.

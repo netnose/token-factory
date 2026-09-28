@@ -8,6 +8,7 @@ import {TokenFactory} from "../src/TokenFactory.sol";
 /// @notice Launches an ERC20 through a deployed factory.
 ///
 /// Env: FACTORY (required), NAME, SYMBOL, SUPPLY (whole tokens), FEE_BPS, MARKET_CAP (wei of ETH), SALT,
+///      CONTRACT_URI (EIP-7572 token metadata URI; permanent, default empty),
 ///      OWNER_BUY (wei of ETH to spend on a fee-free launch buy, default 0)
 ///
 /// forge script script/CreateToken.s.sol --rpc-url base_sepolia --account <keystore> --broadcast
@@ -20,6 +21,7 @@ contract CreateToken is Script {
             totalSupply: vm.envOr("SUPPLY", uint256(1_000_000_000)) * 1e18,
             feeBps: uint16(vm.envOr("FEE_BPS", uint256(500))),
             marketCapEth: vm.envOr("MARKET_CAP", uint256(10 ether)),
+            contractURI: vm.envOr("CONTRACT_URI", string("")),
             salt: vm.envOr("SALT", bytes32(0))
         });
 

@@ -95,7 +95,13 @@ abstract contract FactoryFixture is Test {
 
     function _params(uint16 feeBps) internal pure returns (TokenFactory.ERC20Params memory) {
         return TokenFactory.ERC20Params({
-            name: "Test", symbol: "TST", totalSupply: SUPPLY, feeBps: feeBps, marketCapEth: MARKET_CAP, salt: bytes32(0)
+            name: "Test",
+            symbol: "TST",
+            totalSupply: SUPPLY,
+            feeBps: feeBps,
+            marketCapEth: MARKET_CAP,
+            contractURI: "ipfs://token-meta.json",
+            salt: bytes32(0)
         });
     }
 

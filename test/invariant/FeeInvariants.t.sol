@@ -113,6 +113,7 @@ contract Handler is Test {
             totalSupply: bound(supplyWhole, 1_000, 1e12) * 1e18,
             feeBps: uint16(bound(feeBps, 0, 500)),
             marketCapEth: bound(capGwei, 1e6, 1e12) * 1e9, // 0.001 - 1000 ETH
+            contractURI: "",
             salt: bytes32(tokens.length)
         });
         uint256 value = bound(ownerBuy, 0, 50 ether);

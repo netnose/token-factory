@@ -4,13 +4,15 @@ pragma solidity 0.8.26;
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {ERC2981Upgradeable} from "@openzeppelin/contracts-upgradeable/token/common/ERC2981Upgradeable.sol";
 import {Address} from "@openzeppelin/contracts/utils/Address.sol";
+import {IERC7572} from "../interfaces/IERC7572.sol";
 
 /// @title MintRevenue
 /// @notice Shared plumbing for factory NFT collections:
 ///         - Public-mint revenue: the platform's share (max 10%, fixed at creation) is sent to the factory on every
 ///           mint; the rest stays here for the owner to `withdraw`.
 ///         - ERC-2981 royalties (max 10%), managed by the owner.
-abstract contract MintRevenue is OwnableUpgradeable, ERC2981Upgradeable {
+///         - EIP-7572 contract-level metadata (`contractURI`), set at creation and managed by the owner.
+abstract contract MintRevenue is OwnableUpgradeable, ERC2981Upgradeable, IERC7572 {
     uint16 public constant MAX_PROTOCOL_SHARE_BPS = 1_000;
     uint96 public constant MAX_ROYALTY_BPS = 1_000;
     uint256 internal constant BPS = 10_000;
@@ -19,6 +21,7 @@ abstract contract MintRevenue is OwnableUpgradeable, ERC2981Upgradeable {
     address public factory;
     /// @notice Platform share of mint revenue, in bps.
     uint16 public protocolShareBps;
+    string private _contractURI;
 
     event Withdrawn(address indexed to, uint256 amount);
 
@@ -27,15 +30,20 @@ abstract contract MintRevenue is OwnableUpgradeable, ERC2981Upgradeable {
     error WrongPayment();
     error NothingToWithdraw();
 
-    function __MintRevenue_init(address owner_, uint16 protocolShareBps_, address royaltyReceiver, uint96 royaltyBps)
-        internal
-        onlyInitializing
-    {
+    function __MintRevenue_init(
+        address owner_,
+        uint16 protocolShareBps_,
+        string calldata contractURI_,
+        address royaltyReceiver,
+        uint96 royaltyBps
+    ) internal onlyInitializing {
         if (protocolShareBps_ > MAX_PROTOCOL_SHARE_BPS) revert ProtocolShareTooHigh();
         __Ownable_init(owner_);
         __ERC2981_init();
         factory = msg.sender;
         protocolShareBps = protocolShareBps_;
+        _contractURI = contractURI_;
+        emit ContractURIUpdated();
         _checkRoyalty(royaltyBps);
         if (royaltyBps > 0) _setDefaultRoyalty(royaltyReceiver == address(0) ? owner_ : royaltyReceiver, royaltyBps);
     }
@@ -53,6 +61,21 @@ abstract contract MintRevenue is OwnableUpgradeable, ERC2981Upgradeable {
         if (amount == 0) revert NothingToWithdraw();
         emit Withdrawn(msg.sender, amount);
         Address.sendValue(payable(msg.sender), amount);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Contract-level metadata (EIP-7572)
+    // ---------------------------------------------------------------------------------------------------------------
+
+    /// @inheritdoc IERC7572
+    function contractURI() external view returns (string memory) {
+        return _contractURI;
+    }
+
+    /// @notice Updates the collection-level metadata URI.
+    function setContractURI(string calldata contractURI_) external onlyOwner {
+        _contractURI = contractURI_;
+        emit ContractURIUpdated();
     }
 
     // ---------------------------------------------------------------------------------------------------------------
