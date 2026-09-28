@@ -13,7 +13,8 @@ fs_permissions = [{ access = "read", path = "./" }]
 base_sepolia = "${BASE_SEPOLIA_RPC_URL}"
 
 [etherscan]
-base_sepolia = { key = "${BASESCAN_API_KEY}", chain = 84532, url = "https://api-sepolia.basescan.org/api" }
+# Etherscan API V2: one Etherscan key for every chain (the per-chain Basescan V1 API was retired in Aug 2025).
+base_sepolia = { key = "${ETHERSCAN_API_KEY}", chain = 84532 }
 
 [fmt]
 line_length = 120
